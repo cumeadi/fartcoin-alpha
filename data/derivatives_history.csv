@@ -1,0 +1,2 @@
+timestamp,avg_funding_rate,max_funding_rate,min_funding_rate,funding_rate_spread,total_oi_usd,total_volume_24h_usd,oi_herfindahl,avg_basis_pct,avg_spread,avg_price,n_exchanges
+2026-03-26T06:41:12.449298,0.2295594835412591,10.95,-0.01484,10.964839999999999,162874671.45,440859138.2484207,0.10367365796096926,-0.05044600947841899,1.1361538461538458,0.17999999999999997,52

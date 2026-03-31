@@ -33,7 +33,7 @@ st.set_page_config(
 DATA_DIR = Path(__file__).parent / "data"
 
 SESSION_MAP = {
-    "Asia":     {"utc": "00:00-08:00", "et": "8pm-4am",  "bias": "bearish", "avg_bps": -9.3},
+    "Asia":     {"utc": "00:00-08:00", "et": "8pm-4am",  "bias": "conditional", "avg_bps": -9.3},
     "London":   {"utc": "08:00-13:00", "et": "4am-9am",  "bias": "bullish", "avg_bps": 4.5},
     "NYC":      {"utc": "13:00-21:00", "et": "9am-5pm",  "bias": "neutral", "avg_bps": -2.0},
     "Late NYC": {"utc": "21:00-00:00", "et": "5pm-8pm",  "bias": "bullish", "avg_bps": 10.7},
@@ -46,12 +46,28 @@ HOURLY_BIAS = {
     18: -26.5, 19: 15.8, 20: 18.2, 21: 10.0, 22: 18.9, 23: 3.2,
 }
 
+# Asia sub-sessions and day-of-week patterns
+ASIA_SUB = {
+    "Early Asia (00-04)": {"et": "8pm-12am", "avg_bps": -15.9, "hours": [0, 1, 2, 3]},
+    "Late Asia (04-08)":  {"et": "12am-4am", "avg_bps": -5.4,  "hours": [4, 5, 6, 7]},
+}
+ASIA_DAY_BPS = {
+    "Mon": 3.2, "Tue": -13.1, "Wed": 2.6, "Thu": -34.8,
+    "Fri": 10.9, "Sat": -24.5, "Sun": -17.3,
+}
+
 
 def classify_session(hour):
     if 0 <= hour < 8: return "Asia"
     elif 8 <= hour < 13: return "London"
     elif 13 <= hour < 21: return "NYC"
     else: return "Late NYC"
+
+
+def classify_asia_sub(hour):
+    if 0 <= hour < 4: return "Early Asia"
+    elif 4 <= hour < 8: return "Late Asia"
+    return None
 
 
 def get_current_utc():
@@ -101,6 +117,18 @@ def compute_market_state():
     state["session_info"] = SESSION_MAP[state["session"]]
     state["hourly_bias_bps"] = HOURLY_BIAS.get(now.hour, 0)
     state["weekday"] = now.strftime("%A")
+    state["weekday_short"] = now.strftime("%a")
+    state["asia_sub"] = classify_asia_sub(now.hour)
+    state["asia_day_bps"] = ASIA_DAY_BPS.get(state["weekday_short"], 0)
+
+    # Compute Late NYC carry (prior 3h momentum)
+    ohlcv_carry = data.get("ohlcv")
+    if ohlcv_carry is not None and state["session"] == "Asia":
+        pc = "price" if "price" in ohlcv_carry.columns else "close"
+        ret_3h = ohlcv_carry[pc].pct_change(3).iloc[-1] if len(ohlcv_carry) > 3 else 0
+        state["late_nyc_carry"] = ret_3h
+    else:
+        state["late_nyc_carry"] = 0
 
     # Signal state
     signals = data.get("signals")
@@ -192,12 +220,56 @@ def determine_action(state):
         direction = "FLAT"
         conviction = "N/A"
 
-    # Session filter
+    # Session filter — Asia is CONDITIONAL, not blanket bearish
     session_ok = True
     session_note = ""
-    if direction == "LONG" and session == "Asia":
-        session_ok = False
-        session_note = "Asia session is historically bearish (-9.3 bps/hr). Wait for London open."
+    asia_note = ""
+
+    if session == "Asia":
+        weekday_short = state.get("weekday_short", "")
+        asia_sub = state.get("asia_sub", "")
+        asia_day_bps = state.get("asia_day_bps", 0)
+        carry = state.get("late_nyc_carry", 0)
+
+        # Asia-specific intelligence
+        good_asia_day = weekday_short in ("Mon", "Wed", "Fri")
+        bad_asia_day = weekday_short in ("Thu", "Sat", "Sun")
+        late_asia_window = asia_sub == "Late Asia"  # 04-08 UTC is less negative
+
+        if direction == "LONG":
+            if bad_asia_day:
+                session_ok = False
+                session_note = f"{weekday_short} Asia is toxic ({asia_day_bps:+.0f} bps/hr). Wait for London open."
+            elif good_asia_day and late_asia_window:
+                session_ok = True
+                asia_note = f"{weekday_short} Asia (Late sub-session) is tradeable ({asia_day_bps:+.0f} bps/hr)."
+            elif good_asia_day:
+                session_ok = True
+                asia_note = f"{weekday_short} Asia is positive ({asia_day_bps:+.0f} bps/hr). Early Asia is noisier — smaller size."
+                if conviction == "LOW":
+                    session_ok = False
+                    session_note = "Low conviction + Early Asia = skip. Wait for Late Asia (04:00 UTC) or London."
+            else:
+                # Tue — moderate negative
+                if hourly_bias < -15:
+                    session_ok = False
+                    session_note = f"Current hour has strong negative bias ({hourly_bias:+.0f} bps). Wait."
+                else:
+                    asia_note = f"{weekday_short} Asia is mixed. Proceed with caution."
+
+            # Carry effect: after mild Late NYC up, Asia dumps hardest
+            if carry > 0.005 and carry <= 0.02:
+                asia_note += f" Late NYC carry +{carry:.1%} — CAUTION: mild positive carry → Asia tends to give back (-1.5% avg)."
+                if conviction != "HIGH":
+                    conviction = "LOW"
+
+        elif direction == "SHORT":
+            # SHORT signals during Asia are actually the BEST (0.83% avg return, IC=0.075)
+            asia_note = f"SHORT signals during Asia are high-quality (IC=0.075, avg return 0.83%). Composite signal is MORE predictive during Asia."
+            if bad_asia_day:
+                conviction = "HIGH" if conviction in ("HIGH", "MEDIUM") else "MEDIUM"
+                asia_note += f" {weekday_short} Asia bleeds ({asia_day_bps:+.0f} bps/hr) — tailwind for shorts."
+
     elif direction == "LONG" and hourly_bias < -15:
         session_ok = False
         session_note = f"Current hour ({state['utc_hour']:02d}:00 UTC) has strong negative bias ({hourly_bias:+.0f} bps). Wait."
@@ -225,8 +297,10 @@ def determine_action(state):
     if direction != "FLAT":
         if session in ("London", "Late NYC"):
             timing = "NOW — favorable session"
-        elif session == "Asia":
-            timing = "WAIT — Asia session historically bleeds. Queue for London open (08:00 UTC / 4am ET)"
+        elif session == "Asia" and session_ok:
+            timing = f"CONDITIONAL — {asia_note.split('.')[0]}."
+        elif session == "Asia" and not session_ok:
+            timing = "WAIT — " + (session_note or "Unfavorable Asia conditions. Queue for London open (08:00 UTC / 4am ET)")
         else:
             if hourly_bias > 5:
                 timing = "NOW — current hour has positive bias"
@@ -249,6 +323,7 @@ def determine_action(state):
         "conviction": conviction,
         "session_ok": session_ok,
         "session_note": session_note,
+        "asia_note": asia_note,
         "funding_note": funding_note,
         "btc_note": btc_note,
         "timing": timing,
@@ -298,6 +373,8 @@ else:
     </div>""", unsafe_allow_html=True)
 
 # --- Context Alerts ---
+if action.get("asia_note"):
+    st.info(f"🌏 **Asia Intel:** {action['asia_note']}")
 if action["funding_note"]:
     st.warning(f"💰 **Funding:** {action['funding_note']}")
 if action["btc_note"]:
@@ -427,22 +504,94 @@ with tab_timing:
                     <p style="margin:0;font-size:24px;color:#388e3c"><b>{bps:+.1f} bps/hr</b></p>
                     <p style="margin:4px 0 0 0;color:#388e3c">✅ FAVORABLE for entry</p>
                     </div>""", unsafe_allow_html=True)
-                elif bias == "bearish":
-                    st.markdown(f"""<div style="background:#ffebee;padding:15px;border-radius:8px;border-left:4px solid #d32f2f">
+                elif bias == "conditional":
+                    st.markdown(f"""<div style="background:#e3f2fd;padding:15px;border-radius:8px;border-left:4px solid #1976d2">
                     <h4 style="margin:0">{sess}</h4>
                     <p style="margin:4px 0;color:#666">{info['et']} ET</p>
-                    <p style="margin:0;font-size:24px;color:#d32f2f"><b>{bps:+.1f} bps/hr</b></p>
-                    <p style="margin:4px 0 0 0;color:#d32f2f">⛔ AVOID for longs</p>
+                    <p style="margin:0;font-size:24px;color:#1976d2"><b>{bps:+.1f} bps/hr avg</b></p>
+                    <p style="margin:4px 0 0 0;color:#1976d2">🔀 CONDITIONAL — depends on day & carry</p>
                     </div>""", unsafe_allow_html=True)
-                else:
+                elif bias == "neutral":
                     st.markdown(f"""<div style="background:#fff3e0;padding:15px;border-radius:8px;border-left:4px solid #ff9800">
                     <h4 style="margin:0">{sess}</h4>
                     <p style="margin:4px 0;color:#666">{info['et']} ET</p>
                     <p style="margin:0;font-size:24px;color:#ff9800"><b>{bps:+.1f} bps/hr</b></p>
                     <p style="margin:4px 0 0 0;color:#ff9800">⚠️ CAUTION — most volatile</p>
                     </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""<div style="background:#ffebee;padding:15px;border-radius:8px;border-left:4px solid #d32f2f">
+                    <h4 style="margin:0">{sess}</h4>
+                    <p style="margin:4px 0;color:#666">{info['et']} ET</p>
+                    <p style="margin:0;font-size:24px;color:#d32f2f"><b>{bps:+.1f} bps/hr</b></p>
+                    <p style="margin:4px 0 0 0;color:#d32f2f">⛔ AVOID for longs</p>
+                    </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+
+        # ---------------------------------------------------------------
+        # ASIA SESSION DEEP DIVE
+        # ---------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("🌏 Asia Session Deep Dive")
+        st.caption("Asia isn't uniformly bearish. The desk needs to know WHEN Asia is tradeable.")
+
+        # Sub-session breakdown
+        col_a1, col_a2 = st.columns(2)
+
+        with col_a1:
+            st.markdown("#### Asia Sub-Sessions")
+            early = df[df["hour"].isin([0, 1, 2, 3])]["return"].mean() * 10000
+            late = df[df["hour"].isin([4, 5, 6, 7])]["return"].mean() * 10000
+            st.markdown(f"""<div style="background:#ffebee;padding:12px;border-radius:8px;margin-bottom:8px">
+            <b>Early Asia</b> (00-04 UTC / 8pm-12am ET): <span style="color:#d32f2f;font-size:18px"><b>{early:+.1f} bps/hr</b></span><br>
+            <small>This is where Late NYC momentum dies. 00:00 and 01:00 UTC are the worst hours.</small>
+            </div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div style="background:#fff8e1;padding:12px;border-radius:8px">
+            <b>Late Asia</b> (04-08 UTC / 12am-4am ET): <span style="color:#f57f17;font-size:18px"><b>{late:+.1f} bps/hr</b></span><br>
+            <small>04:00 and 05:00 UTC are actually positive. 07:00 UTC dumps ahead of London.</small>
+            </div>""", unsafe_allow_html=True)
+
+        with col_a2:
+            st.markdown("#### Asia by Day of Week")
+            day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            day_vals = [ASIA_DAY_BPS[d] for d in day_order]
+            colors = ["#388e3c" if v > 0 else "#d32f2f" for v in day_vals]
+            fig_day = go.Figure(go.Bar(x=day_order, y=day_vals, marker_color=colors,
+                                       text=[f"{v:+.0f}" for v in day_vals], textposition="outside"))
+            fig_day.add_hline(y=0, line_color="black", line_width=0.5)
+            fig_day.update_layout(height=250, yaxis_title="Avg bps/hr",
+                                  title="Mon/Wed/Fri = tradeable | Thu/Sat/Sun = toxic")
+            st.plotly_chart(fig_day, use_container_width=True)
+
+        # Carry effect
+        st.markdown("#### Late NYC Carry Effect")
+        st.markdown("""
+        | Late NYC Outcome | Next Asia Avg Return | Interpretation |
+        |-----------------|---------------------|----------------|
+        | **Strong UP (>2%)** | -0.43% | Partial give-back, but not catastrophic |
+        | **Mild UP (0-2%)** | **-1.52%** | **WORST outcome** — Asia dumps hardest after mild Late NYC gains |
+        | **Flat** | -0.43% | Normal Asia bleed |
+        | **Mild DOWN** | -0.47% | Normal Asia bleed |
+        | **Strong DOWN (<-2%)** | -0.57% | Continued selling |
+
+        **Key insight:** The carry correlation is **-0.045** (weakly negative). A strong Late NYC move does NOT predict Asia continuation.
+        The MOST dangerous setup is a mild +0-2% Late NYC — Asia gives it ALL back and then some.
+        """)
+
+        # Signal quality during Asia
+        st.markdown("#### Composite Signal Works BETTER During Asia")
+        st.markdown("""
+        | Metric | Asia Session | All Other Sessions |
+        |--------|-------------|-------------------|
+        | **IC (composite → 4h return)** | **0.075** | 0.053 |
+        | **LONG signals (>0.2) hit rate** | 57% | — |
+        | **SHORT signals (<-0.2) avg return** | **+0.83%** | — |
+
+        **Bottom line for the desk:** When you DO get a signal during Asia, trust it more than usual.
+        SHORT signals during Asia are the highest-quality trades in the entire dataset.
+        """)
+
+        st.markdown("---")
 
         col_l, col_r = st.columns(2)
 
@@ -703,7 +852,7 @@ with tab_rules:
     | Filter | Rule | Reason |
     |--------|------|--------|
     | **Session** | Prefer London (4-9am ET) or Late NYC (5-8pm ET) | Best historical returns |
-    | **Avoid** | Asia session (8pm-4am ET) for longs | Consistent -9.3 bps/hr bleed |
+    | **Asia — conditional** | Longs OK on Mon/Wed/Fri in Late Asia (12am-4am ET). Avoid Thu/Sat/Sun Asia entirely. SHORT signals during Asia are highest quality. | See Asia Deep Dive |
     | **Kill zone** | No new entries at 2pm ET (18:00 UTC) | Worst single hour (-26.5 bps) |
     | **Day of week** | Prefer Mon/Tue/Fri | Thu/Sat/Sun are dump days |
 

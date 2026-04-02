@@ -6,4 +6,5 @@ seaborn>=0.12
 scipy>=1.11
 python-dotenv>=1.0
 streamlit>=1.30
+streamlit-autorefresh>=1.0
 plotly>=5.18

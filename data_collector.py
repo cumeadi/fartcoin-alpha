@@ -96,8 +96,16 @@ def fetch_cg_derivatives_tickers(coin_filter="FARTCOIN"):
     Pull ALL derivative tickers from CoinGecko, filter to our coin.
     Returns real funding rates, OI, volume, spread, basis across exchanges.
     """
-    resp = requests.get(f"{CG_BASE}/derivatives", timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(f"{CG_BASE}/derivatives", timeout=30)
+        if resp.status_code == 429:
+            print(f"       CoinGecko rate limited — waiting 60s...")
+            time.sleep(60)
+            resp = requests.get(f"{CG_BASE}/derivatives", timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"       CoinGecko derivatives failed: {e}")
+        return pd.DataFrame()
     all_tickers = resp.json()
 
     # Filter to our coin's perpetual contracts
@@ -377,6 +385,11 @@ def collect_all(cmc_symbol="FARTCOIN", perp_symbol="FARTCOINUSDT",
     print("[2/4] Fetching CoinGecko historical chart (hourly)...")
     cg_chart = _safe_fetch("CG Chart", fetch_cg_historical_chart, cg_coin_id, days)
     results["cg_chart"] = cg_chart
+
+    # --- Step 2b: CoinGecko BTC chart (hourly for correlation analysis) ---
+    print("[2b/4] Fetching CoinGecko BTC chart (hourly)...")
+    btc_chart = _safe_fetch("CG BTC Chart", fetch_cg_historical_chart, "bitcoin", days)
+    results["btc_chart"] = btc_chart
 
     # --- Step 3: CoinGecko derivatives snapshot (ALL exchanges) ---
     print("[3/4] Fetching CoinGecko derivatives snapshot...")

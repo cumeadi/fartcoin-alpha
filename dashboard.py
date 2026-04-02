@@ -1,27 +1,35 @@
 """
-Fartcoin Alpha — Trade Desk Dashboard
+Fartcoin Alpha — Trade Desk Dashboard (v2)
 
-Actionable dashboard for the trading desk. Shows:
-- Current trade signal and recommended action
-- Entry/exit timing by trading session
-- BTC regime context
-- Cross-exchange positioning for manipulation detection
+Redesigned for analyst usability:
+- Live alert bar at top
+- All projections (including external data) in one place
+- Consistent dark theme, scannable layout
 
 Run: streamlit run dashboard.py --server.port 8501
 """
 
-import streamlit as st
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from pathlib import Path
+import streamlit as st
 from datetime import datetime, timezone
+from pathlib import Path
+from streamlit_autorefresh import st_autorefresh
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+from market_state import (
+    SESSION_MAP, HOURLY_BIAS, ASIA_SUB, ASIA_DAY_BPS,
+    classify_session, classify_asia_sub, compute_market_state,
+    determine_action, _next_positive_hour,
+)
+from projections import compute_projections
+from alerts import evaluate_alerts, evaluate_projection_alerts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="FART Trade Desk",
@@ -30,701 +38,789 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Inject a tighter global style
+st.markdown("""
+<style>
+  /* Reduce default Streamlit padding */
+  .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+  /* Metric label smaller */
+  [data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
+  [data-testid="stMetricValue"] { font-size: 1.1rem !important; font-weight: 700; }
+  /* Tab styling */
+  button[data-baseweb="tab"] { font-size: 0.85rem; padding: 6px 14px; }
+  /* Alert card base */
+  .alert-card { border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; font-size: 0.9rem; }
+  .proj-card  { border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; border-left: 4px solid; }
+</style>
+""", unsafe_allow_html=True)
+
 DATA_DIR = Path(__file__).parent / "data"
 
-SESSION_MAP = {
-    "Asia":     {"utc": "00:00-08:00", "et": "8pm-4am",  "bias": "conditional", "avg_bps": -9.3},
-    "London":   {"utc": "08:00-13:00", "et": "4am-9am",  "bias": "bullish", "avg_bps": 4.5},
-    "NYC":      {"utc": "13:00-21:00", "et": "9am-5pm",  "bias": "neutral", "avg_bps": -2.0},
-    "Late NYC": {"utc": "21:00-00:00", "et": "5pm-8pm",  "bias": "bullish", "avg_bps": 10.7},
-}
+# Auto-refresh every 5 minutes
+st_autorefresh(interval=300_000, key="data_refresh")
 
-HOURLY_BIAS = {
-    0: -21.8, 1: -17.5, 2: 1.1, 3: -17.4, 4: 7.9, 5: 5.1,
-    6: -9.7, 7: -21.7, 8: 7.3, 9: 6.0, 10: 23.4, 11: -15.1,
-    12: 0.8, 13: -9.2, 14: -9.9, 15: -3.8, 16: 5.3, 17: -5.6,
-    18: -26.5, 19: 15.8, 20: 18.2, 21: 10.0, 22: 18.9, 23: 3.2,
-}
-
-# Asia sub-sessions and day-of-week patterns
-ASIA_SUB = {
-    "Early Asia (00-04)": {"et": "8pm-12am", "avg_bps": -15.9, "hours": [0, 1, 2, 3]},
-    "Late Asia (04-08)":  {"et": "12am-4am", "avg_bps": -5.4,  "hours": [4, 5, 6, 7]},
-}
-ASIA_DAY_BPS = {
-    "Mon": 3.2, "Tue": -13.1, "Wed": 2.6, "Thu": -34.8,
-    "Fri": 10.9, "Sat": -24.5, "Sun": -17.3,
-}
+utc_now = datetime.now(timezone.utc)
 
 
-def classify_session(hour):
-    if 0 <= hour < 8: return "Asia"
-    elif 8 <= hour < 13: return "London"
-    elif 13 <= hour < 21: return "NYC"
-    else: return "Late NYC"
-
-
-def classify_asia_sub(hour):
-    if 0 <= hour < 4: return "Early Asia"
-    elif 4 <= hour < 8: return "Late Asia"
-    return None
-
-
-def get_current_utc():
-    return datetime.now(timezone.utc)
-
-
-# ---------------------------------------------------------------------------
-# Data Loading
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading  (includes all external collector files)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def load_all_data():
     data = {}
-    files = {
-        "ohlcv": "FARTCOIN_ohlcv_hourly.csv",
-        "ohlcv_daily": "FARTCOIN_ohlcv.csv",
-        "derivatives": "FARTCOIN_derivatives_snapshot.csv",
-        "signals": "signals.csv",
-        "trades": "trades.csv",
-        "btc": "bitcoin_cg_chart.csv",
-        "funding": "FARTCOINUSDT_funding.csv",
-        "lsr": "FARTCOINUSDT_lsr.csv",
+
+    # Core files (index = timestamp)
+    index_files = {
+        "ohlcv":              "FARTCOIN_ohlcv_hourly.csv",
+        "ohlcv_daily":        "FARTCOIN_ohlcv.csv",
+        "btc":                "bitcoin_cg_chart.csv",
+        "funding":            "FARTCOINUSDT_funding.csv",
+        "lsr":                "FARTCOINUSDT_lsr.csv",
+        "oi":                 "FARTCOINUSDT_oi.csv",
+        "taker":              "FARTCOINUSDT_taker.csv",
+        "signals":            "signals.csv",
+        # External collector files
+        "news_sentiment":         "news_sentiment_hourly.csv",
+        "holder_concentration":   "holder_concentration_history.csv",
+        "exchange_flow":          "exchange_flow_history.csv",
+        "cross_exchange_funding":  "coinalyze_funding_history.csv",
+        "predicted_funding":      "coinalyze_predicted_funding.csv",
+        "liquidations":           "coinalyze_liquidations.csv",
+        "derivatives_history":    "derivatives_history.csv",
+        "fear_greed":             "fear_greed_history.csv",
+        "sentiment_history":      "sentiment_history.csv",
     }
-    for key, fname in files.items():
+    for key, fname in index_files.items():
         f = DATA_DIR / fname
         if f.exists():
-            if key in ("derivatives", "trades"):
-                data[key] = pd.read_csv(f)
-            else:
+            try:
                 data[key] = pd.read_csv(f, index_col=0, parse_dates=True)
+            except Exception:
+                pass
+
+    # Flat CSV files (no datetime index)
+    flat_files = {
+        "derivatives": "FARTCOIN_derivatives_snapshot.csv",
+        "trades":      "trades.csv",
+    }
+    for key, fname in flat_files.items():
+        f = DATA_DIR / fname
+        if f.exists():
+            try:
+                data[key] = pd.read_csv(f)
+            except Exception:
+                pass
+
     return data
 
 
 data = load_all_data()
 
-
-# ---------------------------------------------------------------------------
 # Computed state
-# ---------------------------------------------------------------------------
-
-def compute_market_state():
-    """Compute current market state for action panel."""
-    state = {}
-    now = get_current_utc()
-    state["utc_hour"] = now.hour
-    state["session"] = classify_session(now.hour)
-    state["session_info"] = SESSION_MAP[state["session"]]
-    state["hourly_bias_bps"] = HOURLY_BIAS.get(now.hour, 0)
-    state["weekday"] = now.strftime("%A")
-    state["weekday_short"] = now.strftime("%a")
-    state["asia_sub"] = classify_asia_sub(now.hour)
-    state["asia_day_bps"] = ASIA_DAY_BPS.get(state["weekday_short"], 0)
-
-    # Compute Late NYC carry (prior 3h momentum)
-    ohlcv_carry = data.get("ohlcv")
-    if ohlcv_carry is not None and state["session"] == "Asia":
-        pc = "price" if "price" in ohlcv_carry.columns else "close"
-        ret_3h = ohlcv_carry[pc].pct_change(3).iloc[-1] if len(ohlcv_carry) > 3 else 0
-        state["late_nyc_carry"] = ret_3h
-    else:
-        state["late_nyc_carry"] = 0
-
-    # Signal state
-    signals = data.get("signals")
-    if signals is not None:
-        latest = signals.dropna(subset=["composite"]).iloc[-1]
-        state["composite"] = latest["composite"]
-        state["signals"] = {c: latest[c] for c in signals.columns if c.startswith("sig_") and not np.isnan(latest[c])}
-    else:
-        state["composite"] = 0
-        state["signals"] = {}
-
-    # Derivatives
-    deriv = data.get("derivatives")
-    if deriv is not None:
-        active = deriv[deriv["open_interest_usd"] > 10000]
-        state["avg_funding"] = active["funding_rate"].mean()
-        state["total_oi"] = active["open_interest_usd"].sum()
-        state["total_vol"] = active["volume_24h_usd"].sum()
-        state["oi_vol_ratio"] = state["total_oi"] / state["total_vol"] if state["total_vol"] > 0 else 0
-        state["funding_range"] = active["funding_rate"].max() - active["funding_rate"].min()
-        hhi = ((active["open_interest_usd"] / state["total_oi"]) ** 2).sum()
-        state["hhi"] = hhi
-
-        # Risk score
-        risk = 0
-        if abs(state["avg_funding"]) > 0.01: risk += 2
-        if state["oi_vol_ratio"] < 0.5: risk += 1
-        if hhi > 0.15: risk += 2
-        if state["funding_range"] > 0.05: risk += 1
-        top_share = active["open_interest_usd"].max() / state["total_oi"]
-        if top_share > 0.3: risk += 1
-        state["risk_score"] = risk
-    else:
-        state["avg_funding"] = 0
-        state["risk_score"] = 0
-
-    # BTC context
-    btc = data.get("btc")
-    ohlcv = data.get("ohlcv")
-    if btc is not None and ohlcv is not None:
-        btc_col = "price" if "price" in btc.columns else "close"
-        fart_col = "price" if "price" in ohlcv.columns else "close"
-        btc_ret_24h = btc[btc_col].pct_change(24).iloc[-1] if len(btc) > 24 else 0
-        state["btc_price"] = btc[btc_col].iloc[-1]
-        state["btc_ret_24h"] = btc_ret_24h
-        if btc_ret_24h > 0.03: state["btc_regime"] = "Strong Rally"
-        elif btc_ret_24h > 0.01: state["btc_regime"] = "Mild Rally"
-        elif btc_ret_24h > -0.01: state["btc_regime"] = "Flat"
-        elif btc_ret_24h > -0.03: state["btc_regime"] = "Mild Dump"
-        else: state["btc_regime"] = "Strong Dump"
-
-        state["fart_price"] = ohlcv[fart_col].iloc[-1]
-    else:
-        state["btc_regime"] = "Unknown"
-        state["btc_price"] = 0
-        state["fart_price"] = 0
-
-    return state
-
-
-def determine_action(state):
-    """Determine the trade action based on all signals."""
-    composite = state.get("composite", 0)
-    session = state.get("session", "")
-    funding = state.get("avg_funding", 0)
-    btc_regime = state.get("btc_regime", "")
-    hourly_bias = state.get("hourly_bias_bps", 0)
-
-    # Primary signal
-    if composite > 0.4:
-        direction = "LONG"
-        conviction = "HIGH"
-    elif composite > 0.3:
-        direction = "LONG"
-        conviction = "MEDIUM"
-    elif composite > 0.2:
-        direction = "LONG"
-        conviction = "LOW"
-    elif composite < -0.4:
-        direction = "SHORT"
-        conviction = "HIGH"
-    elif composite < -0.3:
-        direction = "SHORT"
-        conviction = "MEDIUM"
-    elif composite < -0.2:
-        direction = "SHORT"
-        conviction = "LOW"
-    else:
-        direction = "FLAT"
-        conviction = "N/A"
-
-    # Session filter — Asia is CONDITIONAL, not blanket bearish
-    session_ok = True
-    session_note = ""
-    asia_note = ""
-
-    if session == "Asia":
-        weekday_short = state.get("weekday_short", "")
-        asia_sub = state.get("asia_sub", "")
-        asia_day_bps = state.get("asia_day_bps", 0)
-        carry = state.get("late_nyc_carry", 0)
-
-        # Asia-specific intelligence
-        good_asia_day = weekday_short in ("Mon", "Wed", "Fri")
-        bad_asia_day = weekday_short in ("Thu", "Sat", "Sun")
-        late_asia_window = asia_sub == "Late Asia"  # 04-08 UTC is less negative
-
-        if direction == "LONG":
-            if bad_asia_day:
-                session_ok = False
-                session_note = f"{weekday_short} Asia is toxic ({asia_day_bps:+.0f} bps/hr). Wait for London open."
-            elif good_asia_day and late_asia_window:
-                session_ok = True
-                asia_note = f"{weekday_short} Asia (Late sub-session) is tradeable ({asia_day_bps:+.0f} bps/hr)."
-            elif good_asia_day:
-                session_ok = True
-                asia_note = f"{weekday_short} Asia is positive ({asia_day_bps:+.0f} bps/hr). Early Asia is noisier — smaller size."
-                if conviction == "LOW":
-                    session_ok = False
-                    session_note = "Low conviction + Early Asia = skip. Wait for Late Asia (04:00 UTC) or London."
-            else:
-                # Tue — moderate negative
-                if hourly_bias < -15:
-                    session_ok = False
-                    session_note = f"Current hour has strong negative bias ({hourly_bias:+.0f} bps). Wait."
-                else:
-                    asia_note = f"{weekday_short} Asia is mixed. Proceed with caution."
-
-            # Carry effect: after mild Late NYC up, Asia dumps hardest
-            if carry > 0.005 and carry <= 0.02:
-                asia_note += f" Late NYC carry +{carry:.1%} — CAUTION: mild positive carry → Asia tends to give back (-1.5% avg)."
-                if conviction != "HIGH":
-                    conviction = "LOW"
-
-        elif direction == "SHORT":
-            # SHORT signals during Asia are actually the BEST (0.83% avg return, IC=0.075)
-            asia_note = f"SHORT signals during Asia are high-quality (IC=0.075, avg return 0.83%). Composite signal is MORE predictive during Asia."
-            if bad_asia_day:
-                conviction = "HIGH" if conviction in ("HIGH", "MEDIUM") else "MEDIUM"
-                asia_note += f" {weekday_short} Asia bleeds ({asia_day_bps:+.0f} bps/hr) — tailwind for shorts."
-
-    elif direction == "LONG" and hourly_bias < -15:
-        session_ok = False
-        session_note = f"Current hour ({state['utc_hour']:02d}:00 UTC) has strong negative bias ({hourly_bias:+.0f} bps). Wait."
-
-    # Funding rate context
-    funding_note = ""
-    if funding > 0.01:
-        funding_note = f"Funding heavily positive ({funding:.4f}). Longs crowded — contrarian bearish pressure."
-        if direction == "LONG":
-            conviction = "LOW"  # downgrade
-    elif funding < -0.01:
-        funding_note = f"Funding heavily negative ({funding:.4f}). Shorts crowded — contrarian bullish pressure."
-        if direction == "SHORT":
-            conviction = "LOW"
-
-    # BTC context
-    btc_note = ""
-    if "Dump" in btc_regime and direction == "LONG":
-        btc_note = f"BTC in {btc_regime} mode. Fart has 1.6x beta — high risk for longs."
-        conviction = "LOW"
-    elif "Rally" in btc_regime and direction == "LONG":
-        btc_note = f"BTC in {btc_regime} mode. Tailwind for longs (1.6x beta)."
-
-    # Timing
-    if direction != "FLAT":
-        if session in ("London", "Late NYC"):
-            timing = "NOW — favorable session"
-        elif session == "Asia" and session_ok:
-            timing = f"CONDITIONAL — {asia_note.split('.')[0]}."
-        elif session == "Asia" and not session_ok:
-            timing = "WAIT — " + (session_note or "Unfavorable Asia conditions. Queue for London open (08:00 UTC / 4am ET)")
-        else:
-            if hourly_bias > 5:
-                timing = "NOW — current hour has positive bias"
-            elif hourly_bias < -10:
-                timing = f"WAIT — {state['utc_hour']:02d}:00 UTC has {hourly_bias:+.0f} bps bias. Next window: {_next_positive_hour(state['utc_hour']):02d}:00 UTC"
-            else:
-                timing = "ACCEPTABLE — neutral hour"
-    else:
-        timing = "No trade. Wait for signal."
-
-    # Exit plan
-    if direction != "FLAT":
-        exit_plan = "Exit within 4-8 hours (signal decays after 8h, reverses by 24h). " \
-                    "Hard stop if composite flips sign. Kill zone: 18:00 UTC (2pm ET)."
-    else:
-        exit_plan = "N/A"
-
-    return {
-        "direction": direction,
-        "conviction": conviction,
-        "session_ok": session_ok,
-        "session_note": session_note,
-        "asia_note": asia_note,
-        "funding_note": funding_note,
-        "btc_note": btc_note,
-        "timing": timing,
-        "exit_plan": exit_plan,
-    }
-
-
-def _next_positive_hour(current_hour):
-    """Find the next hour with positive historical bias."""
-    for offset in range(1, 24):
-        h = (current_hour + offset) % 24
-        if HOURLY_BIAS.get(h, 0) > 5:
-            return h
-    return (current_hour + 1) % 24
-
-
-mkt = compute_market_state()
+mkt    = compute_market_state(data)
 action = determine_action(mkt)
+proj   = compute_projections(data, mkt)
+
+# Active alerts (both signal-level and projection-level)
+_sig_alerts  = evaluate_alerts(mkt, action)
+_proj_alerts = evaluate_projection_alerts(proj, mkt)
+all_alerts   = _sig_alerts + _proj_alerts
+
+# Data freshness
+_signals_file = DATA_DIR / "signals.csv"
+_data_age_min = None
+if _signals_file.exists():
+    _mtime = datetime.fromtimestamp(os.path.getmtime(_signals_file), tz=timezone.utc)
+    _data_age_min = (utc_now - _mtime).total_seconds() / 60
 
 
-# =========================================================================
-# MAIN LAYOUT — ACTION PANEL (always visible at top)
-# =========================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: colored projection card
+# ─────────────────────────────────────────────────────────────────────────────
 
-st.markdown("### 🎯 FARTCOIN TRADE DESK")
+def _proj_card(title, body, color="#1565c0", icon=""):
+    st.markdown(
+        f'<div class="proj-card" style="border-color:{color};background:{color}18">'
+        f'<b>{icon} {title}</b><br><span style="color:#ccc">{body}</span></div>',
+        unsafe_allow_html=True,
+    )
 
-# --- Action Banner ---
-direction = action["direction"]
-if direction == "LONG":
-    color = "#1b5e20" if action["conviction"] == "HIGH" else "#388e3c" if action["conviction"] == "MEDIUM" else "#66bb6a"
-    st.markdown(f"""<div style="background:{color};color:white;padding:20px;border-radius:10px;margin-bottom:16px">
-    <h2 style="margin:0;color:white">⬆️ LONG — {action['conviction']} CONVICTION</h2>
-    <p style="margin:8px 0 0 0;font-size:16px;color:white"><b>Timing:</b> {action['timing']}</p>
-    <p style="margin:4px 0 0 0;font-size:14px;color:rgba(255,255,255,0.9)"><b>Exit:</b> {action['exit_plan']}</p>
-    </div>""", unsafe_allow_html=True)
-elif direction == "SHORT":
-    color = "#b71c1c" if action["conviction"] == "HIGH" else "#d32f2f" if action["conviction"] == "MEDIUM" else "#ef5350"
-    st.markdown(f"""<div style="background:{color};color:white;padding:20px;border-radius:10px;margin-bottom:16px">
-    <h2 style="margin:0;color:white">⬇️ SHORT — {action['conviction']} CONVICTION</h2>
-    <p style="margin:8px 0 0 0;font-size:16px;color:white"><b>Timing:</b> {action['timing']}</p>
-    <p style="margin:4px 0 0 0;font-size:14px;color:rgba(255,255,255,0.9)"><b>Exit:</b> {action['exit_plan']}</p>
-    </div>""", unsafe_allow_html=True)
-else:
-    st.markdown(f"""<div style="background:#424242;color:white;padding:20px;border-radius:10px;margin-bottom:16px">
-    <h2 style="margin:0;color:white">⏸️ NO TRADE — WAIT FOR SIGNAL</h2>
-    <p style="margin:8px 0 0 0;font-size:14px;color:rgba(255,255,255,0.8)">Composite: {mkt['composite']:.3f} (need > 0.2 for LONG or < -0.2 for SHORT)</p>
-    </div>""", unsafe_allow_html=True)
 
-# --- Context Alerts ---
-if action.get("asia_note"):
-    st.info(f"🌏 **Asia Intel:** {action['asia_note']}")
-if action["funding_note"]:
-    st.warning(f"💰 **Funding:** {action['funding_note']}")
-if action["btc_note"]:
-    st.info(f"₿ **BTC Context:** {action['btc_note']}")
-if action["session_note"]:
-    st.error(f"⏰ **Session Warning:** {action['session_note']}")
+def _severity_color(sev):
+    return {"high": "#c62828", "medium": "#e65100", "low": "#1b5e20"}.get(sev, "#37474f")
 
-# --- Key Metrics Row ---
-col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-col1.metric("FART Price", f"${mkt['fart_price']:.4f}")
-col2.metric("Composite", f"{mkt['composite']:+.3f}")
-col3.metric("Funding Rate", f"{mkt.get('avg_funding', 0):.4f}")
-col4.metric("BTC", f"${mkt.get('btc_price', 0):,.0f}", delta=f"{mkt.get('btc_ret_24h', 0):.1%} 24h")
-col5.metric("Total OI", f"${mkt.get('total_oi', 0)/1e6:.0f}M")
-col6.metric("Session", f"{mkt['session']} ({mkt.get('session_info', {}).get('et', '')})")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER — single line of key metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+direction  = action["direction"]
+conviction = action["conviction"]
+composite  = mkt["composite"]
+session    = mkt["session"]
+fart_price = mkt["fart_price"]
+btc_price  = mkt.get("btc_price", 0)
 risk_score = mkt.get("risk_score", 0)
 risk_label = "HIGH" if risk_score >= 4 else "MOD" if risk_score >= 2 else "LOW"
-col7.metric("Manip. Risk", f"{risk_label} ({risk_score}/7)")
+avg_funding= mkt.get("avg_funding", 0)
+total_oi   = mkt.get("total_oi", 0)
+
+# Direction banner
+_dir_colors = {
+    "LONG":  {"HIGH": "#1b5e20", "MEDIUM": "#2e7d32", "LOW": "#388e3c"},
+    "SHORT": {"HIGH": "#b71c1c", "MEDIUM": "#c62828", "LOW": "#d32f2f"},
+    "FLAT":  {"HIGH": "#37474f", "MEDIUM": "#37474f", "LOW": "#37474f"},
+}
+_banner_color = _dir_colors.get(direction, _dir_colors["FLAT"]).get(conviction, "#37474f")
+_dir_icon = {"LONG": "⬆️", "SHORT": "⬇️", "FLAT": "⏸️"}.get(direction, "⏸️")
+
+freshness_html = ""
+if _data_age_min is not None:
+    if _data_age_min < 35:
+        freshness_html = f'<span style="font-size:0.75rem;opacity:0.7">Data {_data_age_min:.0f}m ago</span>'
+    else:
+        freshness_html = f'<span style="font-size:0.75rem;color:#ff8f00">⚠ Data {_data_age_min:.0f}m old</span>'
+
+st.markdown(
+    f"""<div style="background:{_banner_color};color:white;padding:14px 20px;
+    border-radius:10px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <span style="font-size:1.5rem;font-weight:800">{_dir_icon} {direction} — {conviction} CONVICTION</span>
+      <span style="margin-left:20px;font-size:0.95rem;opacity:0.9">{action['timing']}</span>
+    </div>
+    <div style="text-align:right;font-size:0.8rem;opacity:0.85">
+      {freshness_html}<br>
+      {utc_now.strftime('%H:%M UTC')}
+    </div>
+    </div>""",
+    unsafe_allow_html=True,
+)
+
+# Metric strip
+mc = st.columns(8)
+mc[0].metric("FART", f"${fart_price:.4f}")
+mc[1].metric("Composite", f"{composite:+.3f}")
+mc[2].metric("Funding", f"{avg_funding:.4f}")
+mc[3].metric("BTC", f"${btc_price:,.0f}")
+mc[4].metric("BTC Regime", mkt.get("btc_regime", "?"))
+mc[5].metric("OI", f"${total_oi/1e6:.0f}M")
+mc[6].metric("Session", f"{session} ({mkt.get('session_info',{}).get('et','')})")
+mc[7].metric("Manip Risk", f"{risk_label} {risk_score}/7")
+
+# Inline notes (funding, BTC, session warnings) — compact
+_notes = []
+if action.get("funding_note"):  _notes.append(("💰", action["funding_note"], "warning"))
+if action.get("btc_note"):      _notes.append(("₿",  action["btc_note"],     "info"))
+if action.get("session_note"):  _notes.append(("⏰", action["session_note"],  "error"))
+if action.get("asia_note"):     _notes.append(("🌏", action["asia_note"],    "info"))
+for icon, note, kind in _notes:
+    getattr(st, kind)(f"{icon} {note}")
 
 st.markdown("---")
 
-# =========================================================================
-# TABS
-# =========================================================================
 
-tab_signal, tab_timing, tab_exchange, tab_btc, tab_rules = st.tabs([
-    "📊 Signal Dashboard",
-    "⏰ Session Timing",
-    "🏦 Exchange Intel",
-    "₿ BTC Context",
-    "📋 Trade Rules",
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTIVE ALERTS BAR  (always visible before tabs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if all_alerts:
+    st.markdown(f"#### 🚨 Active Alerts ({len(all_alerts)})")
+    for al in all_alerts:
+        sev   = al.get("severity", "low")
+        color = _severity_color(sev)
+        label = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(sev, sev.upper())
+        st.markdown(
+            f'<div class="alert-card" style="background:{color}22;border-left:4px solid {color}">'
+            f'<b style="color:{color}">[{label}]</b> {al["title"]}</div>',
+            unsafe_allow_html=True,
+        )
+else:
+    st.success("✅ No active alerts")
+
+st.markdown("---")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────────────
+
+tab_signal, tab_proj, tab_timing, tab_exchange, tab_btc, tab_rules = st.tabs([
+    "📊 Signal",
+    "🔮 Projections",
+    "⏰ Timing",
+    "🏦 Exchange",
+    "₿ BTC",
+    "📋 Rules",
 ])
 
-# =========================================================================
-# TAB 1: Signal Dashboard
-# =========================================================================
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 1 — SIGNAL DASHBOARD
+# ═════════════════════════════════════════════════════════════════════════════
 
 with tab_signal:
     signals = data.get("signals")
-    ohlcv = data.get("ohlcv")
+    ohlcv   = data.get("ohlcv")
 
-    if signals is not None and ohlcv is not None:
+    if signals is None or ohlcv is None:
+        st.warning("Run signal_engine.py to generate signals.")
+    else:
         price_col = "price" if "price" in ohlcv.columns else "close"
 
-        # --- Price + Composite overlaid ---
-        st.subheader("Price Action vs Composite Signal")
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.3, 0.2],
-                            vertical_spacing=0.04,
-                            subplot_titles=["FARTCOIN Price", "Composite Signal", "Volume"])
+        # ── Signal component gauges (top of tab) ─────────────────────────────
+        st.markdown("#### Signal Components — Current Reading")
+        sig_cols = [c for c in signals.columns if c.startswith("sig_")]
+        sig_vals = {c: float(signals[c].dropna().iloc[-1]) for c in sig_cols
+                    if len(signals[c].dropna()) > 0}
 
-        fig.add_trace(go.Scatter(x=ohlcv.index, y=ohlcv[price_col], name="Price",
-                                 line=dict(color="#1f77b4", width=1.5)), row=1, col=1)
+        if sig_vals:
+            cols = st.columns(len(sig_vals))
+            for i, (col_name, val) in enumerate(sig_vals.items()):
+                label = col_name.replace("sig_", "").replace("_", " ").title()
+                icon  = "🟢" if val > 0.2 else "🔴" if val < -0.2 else "⚪"
+                cols[i].metric(f"{icon} {label}", f"{val:+.3f}")
 
-        # Signal with colored zones
+        st.markdown("---")
+
+        # ── Price + Composite chart ───────────────────────────────────────────
+        st.markdown("#### Price vs Composite Signal")
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.5, 0.3, 0.2], vertical_spacing=0.03,
+            subplot_titles=["FARTCOIN Price", "Composite Signal", "Volume"],
+        )
+
+        fig.add_trace(go.Scatter(
+            x=ohlcv.index, y=ohlcv[price_col], name="Price",
+            line=dict(color="#64b5f6", width=1.5)), row=1, col=1)
+
         comp = signals["composite"]
-        fig.add_trace(go.Scatter(x=comp.index, y=comp, name="Composite",
-                                 line=dict(color="#1f77b4", width=1)), row=2, col=1)
-        fig.add_hline(y=0.4, line_color="green", line_dash="dash", row=2, col=1,
-                      annotation_text="LONG ENTRY (0.4)")
-        fig.add_hline(y=0.2, line_color="green", line_dash="dot", row=2, col=1,
-                      annotation_text="Low conviction (0.2)")
-        fig.add_hline(y=-0.2, line_color="red", line_dash="dot", row=2, col=1)
-        fig.add_hline(y=-0.4, line_color="red", line_dash="dash", row=2, col=1,
-                      annotation_text="SHORT ENTRY (-0.4)")
-        fig.add_hrect(y0=0.4, y1=0.6, fillcolor="green", opacity=0.08, row=2, col=1)
-        fig.add_hrect(y0=-0.6, y1=-0.4, fillcolor="red", opacity=0.08, row=2, col=1)
+        fig.add_trace(go.Scatter(
+            x=comp.index, y=comp, name="Composite",
+            line=dict(color="#90caf9", width=1)), row=2, col=1)
 
-        fig.add_trace(go.Bar(x=ohlcv.index, y=ohlcv["volume"], name="Volume",
-                             marker_color="rgba(100,100,100,0.3)"), row=3, col=1)
+        for level, color, dash in [
+            (0.4,  "#66bb6a", "dash"), (0.2,  "#a5d6a7", "dot"),
+            (-0.2, "#ef9a9a", "dot"),  (-0.4, "#e57373", "dash"),
+        ]:
+            fig.add_hline(y=level, line_color=color, line_dash=dash, row=2, col=1)
 
-        fig.update_layout(height=700, showlegend=False, hovermode="x unified")
+        fig.add_hrect(y0=0.4, y1=0.7,  fillcolor="#66bb6a", opacity=0.06, row=2, col=1)
+        fig.add_hrect(y0=-0.7, y1=-0.4, fillcolor="#e57373", opacity=0.06, row=2, col=1)
+        fig.add_hline(y=composite, line_color="yellow", line_dash="dot",
+                      annotation_text=f"NOW {composite:+.3f}", row=2, col=1)
+
+        fig.add_trace(go.Bar(
+            x=ohlcv.index, y=ohlcv["volume"], name="Volume",
+            marker_color="rgba(120,120,120,0.3)"), row=3, col=1)
+
+        fig.update_layout(
+            height=650, showlegend=False, hovermode="x unified",
+            template="plotly_dark", margin=dict(t=30, b=10),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Signal Component Gauges ---
-        st.subheader("Signal Components (Current)")
-        sig_cols = [c for c in signals.columns if c.startswith("sig_") and not np.isnan(signals[c].dropna().iloc[-1] if len(signals[c].dropna()) > 0 else np.nan)]
-        n_sigs = len(sig_cols)
-        if n_sigs > 0:
-            cols = st.columns(min(n_sigs, 7))
-            for i, col_name in enumerate(sig_cols):
-                val = signals[col_name].dropna().iloc[-1] if len(signals[col_name].dropna()) > 0 else 0
-                label = col_name.replace("sig_", "").replace("_", " ").title()
-                with cols[i % len(cols)]:
-                    # Color based on value
-                    if val > 0.2: icon = "🟢"
-                    elif val < -0.2: icon = "🔴"
-                    else: icon = "⚪"
-                    st.metric(f"{icon} {label}", f"{val:+.3f}")
-
-        # --- Historical trade performance ---
+        # ── Historical trades ─────────────────────────────────────────────────
         trades = data.get("trades")
         if trades is not None and not trades.empty:
-            st.subheader("Historical Trades")
-            st.dataframe(trades, use_container_width=True, hide_index=True)
-
-    else:
-        st.warning("Run signal_engine.py to generate signals.")
+            with st.expander("📜 Historical Trades"):
+                st.dataframe(trades, use_container_width=True, hide_index=True)
 
 
-# =========================================================================
-# TAB 2: Session Timing
-# =========================================================================
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 2 — FORWARD PROJECTIONS  (all models incl. external data)
+# ═════════════════════════════════════════════════════════════════════════════
+
+with tab_proj:
+
+    # ── Row 0: Exit plan reminder ─────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:#263238;border-left:4px solid #546e7a;'
+        f'border-radius:6px;padding:10px 16px;margin-bottom:14px;font-size:0.9rem">'
+        f'📌 <b>Exit Plan:</b> {action["exit_plan"]}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Row 1: Probability + Manipulation cycle ───────────────────────────────
+    r1a, r1b = st.columns([3, 2])
+
+    prob_data = proj.get("probability", {})
+    prob_val  = prob_data.get("prob_positive_4h", 0.5)
+    exp_move  = prob_data.get("expected_move_pct", 0)
+    prob_conv = prob_data.get("conviction", "LOW")
+
+    with r1a:
+        st.markdown("#### Probability Model")
+        pcolor = "#1b5e20" if prob_val > 0.6 else "#b71c1c" if prob_val < 0.4 else "#1565c0"
+        st.markdown(
+            f'<div class="proj-card" style="border-color:{pcolor};background:{pcolor}22">'
+            f'<span style="font-size:2rem;font-weight:800;color:{pcolor}">{prob_val:.0%}</span>'
+            f'&nbsp;&nbsp;probability of positive 4h return<br>'
+            f'<b>Expected move:</b> {exp_move:+.2f}% &nbsp;|&nbsp; '
+            f'<b>Conviction:</b> {prob_conv} &nbsp;|&nbsp; '
+            f'<b>n=</b>{prob_data.get("model_n_train", 0):,}<br>'
+            f'<span style="font-size:0.8rem;color:#aaa">{prob_data.get("description","")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    cycle = proj.get("manipulation_cycle", {})
+    phase = cycle.get("phase", "DORMANT")
+    with r1b:
+        st.markdown("#### Manipulation Cycle")
+        _ccolors = {
+            "SPIKE_IN_PROGRESS": "#b71c1c",
+            "BUILDUP":           "#e65100",
+            "QUIET_ACCUMULATION":"#1565c0",
+            "DORMANT":           "#37474f",
+        }
+        ccolor = _ccolors.get(phase, "#37474f")
+        est    = cycle.get("est_hours_to_move")
+        est_txt = f"Est. move: ~{est}h" if est is not None else ""
+        st.markdown(
+            f'<div class="proj-card" style="border-color:{ccolor};background:{ccolor}22">'
+            f'<span style="font-size:1.2rem;font-weight:800;color:{ccolor}">{phase}</span> '
+            f'({cycle.get("confidence", 0):.0%} conf)<br>'
+            f'{est_txt}<br>'
+            f'<span style="font-size:0.8rem;color:#aaa">{cycle.get("description","")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # ── Row 2: Price fan chart ────────────────────────────────────────────────
+    ci  = proj.get("confidence_intervals", {})
+    h4  = ci.get("h4")
+    h8  = ci.get("h8")
+
+    ohlcv_chart = data.get("ohlcv")
+    if h4 and h8 and ohlcv_chart is not None:
+        price_col = "price" if "price" in ohlcv_chart.columns else "close"
+        recent    = ohlcv_chart[price_col].iloc[-24:]
+
+        fig_fan = go.Figure()
+        fig_fan.add_trace(go.Scatter(
+            x=list(range(-len(recent), 0)), y=recent.values,
+            mode="lines", name="History", line=dict(color="#90caf9", width=2),
+        ))
+
+        hours_fwd = [0, 4, 8]
+        cur = float(recent.iloc[-1])
+        centers  = [cur, h4["center"],  h8["center"]]
+        high_95  = [cur, h4["high_95"], h8["high_95"]]
+        low_95   = [cur, h4["low_95"],  h8["low_95"]]
+        high_68  = [cur, h4["high_68"], h8["high_68"]]
+        low_68   = [cur, h4["low_68"],  h8["low_68"]]
+
+        fig_fan.add_trace(go.Scatter(x=hours_fwd, y=high_95, mode="lines",
+                                     line=dict(width=0), showlegend=False))
+        fig_fan.add_trace(go.Scatter(x=hours_fwd, y=low_95, mode="lines",
+                                     line=dict(width=0), fill="tonexty",
+                                     fillcolor="rgba(100,181,246,0.12)", name="95% CI"))
+        fig_fan.add_trace(go.Scatter(x=hours_fwd, y=high_68, mode="lines",
+                                     line=dict(width=0), showlegend=False))
+        fig_fan.add_trace(go.Scatter(x=hours_fwd, y=low_68, mode="lines",
+                                     line=dict(width=0), fill="tonexty",
+                                     fillcolor="rgba(100,181,246,0.30)", name="68% CI"))
+        fig_fan.add_trace(go.Scatter(x=hours_fwd, y=centers, mode="lines+markers",
+                                     name="Expected", line=dict(color="#ffeb3b", dash="dash", width=2)))
+        fig_fan.add_vline(x=0, line_color="#546e7a", line_dash="dash")
+        fig_fan.update_layout(
+            title=f"4h: ${h4['low_68']:.4f} – ${h4['high_68']:.4f} (68%) | "
+                  f"${h4['low_95']:.4f} – ${h4['high_95']:.4f} (95%)",
+            xaxis_title="Hours (0 = now)", yaxis_title="Price ($)",
+            template="plotly_dark", height=320,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_fan, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Row 3: Mean reversion — Funding & LSR ────────────────────────────────
+    st.markdown("#### Mean Reversion Models")
+    mr = proj.get("mean_reversion", {})
+    mr_c1, mr_c2 = st.columns(2)
+
+    with mr_c1:
+        fr_data = mr.get("funding")
+        if fr_data and fr_data.get("projected_path"):
+            path = fr_data["projected_path"]
+            fig_fr = go.Figure()
+            fig_fr.add_trace(go.Scatter(
+                x=list(range(1, len(path)+1)), y=path, mode="lines",
+                name="Projected", line=dict(color="#4dd0e1", dash="dash", width=2)))
+            fig_fr.add_hline(y=fr_data["mean"], line_dash="dot",
+                             annotation_text="Mean", line_color="#546e7a")
+            fig_fr.update_layout(
+                title=f"Funding Rate  (½-life {fr_data['half_life_h']:.1f}h, real {fr_data.get('current_real',0):.4f})",
+                xaxis_title="Hours", yaxis_title="Rate",
+                template="plotly_dark", height=260, margin=dict(t=36, b=10),
+            )
+            st.plotly_chart(fig_fr, use_container_width=True)
+            st.caption(fr_data.get("description", ""))
+        else:
+            st.info("No funding reversion data")
+
+    with mr_c2:
+        lsr_data = mr.get("lsr")
+        if lsr_data and lsr_data.get("projected_path"):
+            path = lsr_data["projected_path"]
+            pct  = lsr_data.get("percentile", 0.5)
+            bar_color = "#e57373" if pct < 0.3 else "#66bb6a" if pct > 0.7 else "#90caf9"
+            fig_lsr = go.Figure()
+            fig_lsr.add_trace(go.Scatter(
+                x=list(range(1, len(path)+1)), y=path, mode="lines",
+                name="Projected", line=dict(color=bar_color, dash="dash", width=2)))
+            fig_lsr.add_hline(y=lsr_data.get("median", 1.0), line_dash="dot",
+                              annotation_text="Median", line_color="#546e7a")
+            fig_lsr.update_layout(
+                title=f"Long/Short Ratio  (now {lsr_data['current']:.3f}, {pct:.0%}ile)",
+                xaxis_title="Hours", yaxis_title="LSR",
+                template="plotly_dark", height=260, margin=dict(t=36, b=10),
+            )
+            st.plotly_chart(fig_lsr, use_container_width=True)
+            st.caption(lsr_data.get("description", ""))
+        else:
+            st.info("No LSR reversion data")
+
+    st.markdown("---")
+
+    # ── Row 4: BTC Lead-Lag + Session Edge ───────────────────────────────────
+    st.markdown("#### Context Models")
+    ctx_c1, ctx_c2 = st.columns(2)
+
+    btc_ll    = proj.get("btc_lead_lag", {})
+    btc_2h    = btc_ll.get("btc_2h_return_pct", 0)
+    proj_fart = btc_ll.get("projected_fart_move_pct", 0)
+    btc_conf  = btc_ll.get("confidence", 0)
+
+    with ctx_c1:
+        st.markdown("**BTC Lead-Lag**")
+        ll_color = "#b71c1c" if abs(btc_2h) > 2 else "#e65100" if abs(btc_2h) > 1 else "#1565c0"
+        _proj_card(
+            f"BTC +{btc_2h:+.1f}% → FART {proj_fart:+.1f}% projected",
+            btc_ll.get("description", "No data"),
+            color=ll_color, icon="₿",
+        )
+        bc1, bc2, bc3 = st.columns(3)
+        bc1.metric("BTC 2h", f"{btc_2h:+.1f}%")
+        bc2.metric("FART proj", f"{proj_fart:+.1f}%")
+        bc3.metric("Confidence", f"{btc_conf:.0%}")
+
+    sess_cond = proj.get("session_conditional", {})
+    edge      = sess_cond.get("combined_edge_pct", 0)
+    quality   = sess_cond.get("quality", "")
+    with ctx_c2:
+        st.markdown("**Session-Conditional Edge**")
+        se_color = "#1b5e20" if edge > 0.5 else "#b71c1c" if edge < -0.5 else "#e65100"
+        _proj_card(
+            f"Edge: {edge:+.2f}%  [{quality}]",
+            sess_cond.get("description", "No data"),
+            color=se_color, icon="⏰",
+        )
+        sc1, sc2 = st.columns(2)
+        sc1.metric("Combined Edge", f"{edge:+.2f}%")
+        sc2.metric("Samples", f"n={sess_cond.get('n_samples',0)}")
+
+    st.markdown("---")
+
+    # ── Row 5: External data projections ─────────────────────────────────────
+    st.markdown("#### External Data Signals")
+    ext_c1, ext_c2, ext_c3 = st.columns(3)
+
+    # — News / Sentiment ——————————————————————————————————————————————————
+    news = proj.get("news_sentiment", {})
+    with ext_c1:
+        st.markdown("**Sentiment**")
+        if not news.get("available"):
+            st.info("No sentiment data — run external_collectors.py")
+        else:
+            na = news.get("assessment", "NEUTRAL")
+            nd = news.get("divergence", "NONE")
+            na_color = "#b71c1c" if na in ("DANGER","CAUTION") else \
+                       "#1b5e20" if na == "BULLISH" else "#1565c0"
+            fg_val   = news.get("fear_greed_value", 0)
+            fg_class = news.get("fear_greed_class", "")
+            fg_color = "#e57373" if fg_val < 30 else "#66bb6a" if fg_val > 60 else "#ffb74d"
+            st.markdown(
+                f'<div class="proj-card" style="border-color:{na_color};background:{na_color}18">'
+                f'<b style="color:{na_color}">{na}</b>'
+                f'{"  |  Divergence: <b>" + nd + "</b>" if nd != "NONE" else ""}<br>'
+                f'<span style="color:{fg_color}">Fear&Greed: <b>{fg_val} ({fg_class})</b></span><br>'
+                f'Community bullish: <b>{news.get("cg_sentiment_up_pct",0):.0f}%</b> &nbsp;|&nbsp; '
+                f'Composite: <b>{news.get("sentiment_composite",0):.3f}</b><br>'
+                f'<span style="font-size:0.8rem;color:#aaa">{news.get("description","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # — On-chain / Exchange Flow ——————————————————————————————————————————
+    onchain = proj.get("onchain_flow", {})
+    with ext_c2:
+        st.markdown("**On-Chain Flow**")
+        if not onchain.get("available"):
+            st.info("No on-chain data — run external_collectors.py")
+        else:
+            oa = onchain.get("assessment", "NEUTRAL")
+            oc = "#b71c1c" if "DUMP" in oa or "INFLOW" in oa else \
+                 "#1b5e20" if "ACCUM" in oa or "WITHDRAWAL" in oa else "#1565c0"
+            net = onchain.get("net_flow_tokens", 0)
+            st.markdown(
+                f'<div class="proj-card" style="border-color:{oc};background:{oc}18">'
+                f'<b style="color:{oc}">{oa}</b><br>'
+                f'Net flow: <b>{net:+,.0f} tokens</b><br>'
+                f'Whale transfers: <b>{onchain.get("whale_transfers",0)}</b> &nbsp;|&nbsp; '
+                f'Gini: <b>{onchain.get("gini",0):.3f}</b> ({onchain.get("gini_trend","?")})<br>'
+                f'Top-10 holders: <b>{onchain.get("top10_pct",0):.1f}%</b><br>'
+                f'<span style="font-size:0.8rem;color:#aaa">{onchain.get("description","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # — Cross-Exchange / Squeeze ——————————————————————————————————————————
+    cx = proj.get("cross_exchange", {})
+    with ext_c3:
+        st.markdown("**Cross-Exchange / Squeeze**")
+        if not cx.get("available"):
+            st.info("No cross-exchange data — run external_collectors.py")
+        else:
+            ca = cx.get("assessment", "NORMAL")
+            sq = cx.get("squeeze_risk", "LOW")
+            cc = "#b71c1c" if sq == "HIGH" or "SQUEEZE" in ca else \
+                 "#e65100" if sq == "MEDIUM" else "#1565c0"
+            pf = cx.get("predicted_funding", 0)
+            st.markdown(
+                f'<div class="proj-card" style="border-color:{cc};background:{cc}18">'
+                f'<b style="color:{cc}">{ca}</b><br>'
+                f'Squeeze risk: <b style="color:{cc}">{sq}</b><br>'
+                f'Predicted funding: <b>{pf:.4f}</b><br>'
+                f'Funding arb: <b>{cx.get("funding_arb","?")}</b> &nbsp;|&nbsp; '
+                f'Liq z-score: <b>{cx.get("liq_zscore",0):.2f}</b><br>'
+                f'<span style="font-size:0.8rem;color:#aaa">{cx.get("description","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — SESSION TIMING
+# ═════════════════════════════════════════════════════════════════════════════
 
 with tab_timing:
-    st.subheader("When to Trade — Session & Hour Analysis")
-
     ohlcv = data.get("ohlcv")
-    if ohlcv is not None:
+    if ohlcv is None:
+        st.warning("No OHLCV data.")
+    else:
         price_col = "price" if "price" in ohlcv.columns else "close"
-        df = ohlcv.copy()
-        df["return"] = df[price_col].pct_change()
+        df        = ohlcv.copy()
+        df["return"]     = df[price_col].pct_change()
         df["abs_return"] = df["return"].abs()
-        df["hour"] = df.index.hour
-        df["session"] = df["hour"].apply(classify_session)
+        df["hour"]       = df.index.hour
+        df["session"]    = df["hour"].apply(classify_session)
 
-        # --- Session Cards ---
-        st.markdown("#### Session Performance (Your NYC Time)")
-        cols = st.columns(4)
+        # Session cards
+        st.markdown("#### Session Performance")
+        scols = st.columns(4)
+        _s_styles = {
+            "bullish":     ("#e8f5e9", "#2e7d32", "✅ FAVORABLE"),
+            "conditional": ("#e3f2fd", "#1565c0", "🔀 CONDITIONAL"),
+            "neutral":     ("#fff3e0", "#e65100", "⚠️ VOLATILE"),
+            "bearish":     ("#ffebee", "#c62828", "⛔ AVOID"),
+        }
         for i, (sess, info) in enumerate(SESSION_MAP.items()):
-            with cols[i]:
-                bps = info["avg_bps"]
-                bias = info["bias"]
-                if bias == "bullish":
-                    st.markdown(f"""<div style="background:#e8f5e9;padding:15px;border-radius:8px;border-left:4px solid #388e3c">
-                    <h4 style="margin:0">{sess}</h4>
-                    <p style="margin:4px 0;color:#666">{info['et']} ET</p>
-                    <p style="margin:0;font-size:24px;color:#388e3c"><b>{bps:+.1f} bps/hr</b></p>
-                    <p style="margin:4px 0 0 0;color:#388e3c">✅ FAVORABLE for entry</p>
-                    </div>""", unsafe_allow_html=True)
-                elif bias == "conditional":
-                    st.markdown(f"""<div style="background:#e3f2fd;padding:15px;border-radius:8px;border-left:4px solid #1976d2">
-                    <h4 style="margin:0">{sess}</h4>
-                    <p style="margin:4px 0;color:#666">{info['et']} ET</p>
-                    <p style="margin:0;font-size:24px;color:#1976d2"><b>{bps:+.1f} bps/hr avg</b></p>
-                    <p style="margin:4px 0 0 0;color:#1976d2">🔀 CONDITIONAL — depends on day & carry</p>
-                    </div>""", unsafe_allow_html=True)
-                elif bias == "neutral":
-                    st.markdown(f"""<div style="background:#fff3e0;padding:15px;border-radius:8px;border-left:4px solid #ff9800">
-                    <h4 style="margin:0">{sess}</h4>
-                    <p style="margin:4px 0;color:#666">{info['et']} ET</p>
-                    <p style="margin:0;font-size:24px;color:#ff9800"><b>{bps:+.1f} bps/hr</b></p>
-                    <p style="margin:4px 0 0 0;color:#ff9800">⚠️ CAUTION — most volatile</p>
-                    </div>""", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""<div style="background:#ffebee;padding:15px;border-radius:8px;border-left:4px solid #d32f2f">
-                    <h4 style="margin:0">{sess}</h4>
-                    <p style="margin:4px 0;color:#666">{info['et']} ET</p>
-                    <p style="margin:0;font-size:24px;color:#d32f2f"><b>{bps:+.1f} bps/hr</b></p>
-                    <p style="margin:4px 0 0 0;color:#d32f2f">⛔ AVOID for longs</p>
-                    </div>""", unsafe_allow_html=True)
+            bg, fc, label = _s_styles.get(info["bias"], ("#424242", "#fff", ""))
+            scols[i].markdown(
+                f'<div style="background:{bg};padding:14px;border-radius:8px;'
+                f'border-left:5px solid {fc}">'
+                f'<b style="color:{fc}">{sess}</b><br>'
+                f'<span style="color:#555;font-size:0.8rem">{info["et"]} ET</span><br>'
+                f'<span style="font-size:1.6rem;font-weight:800;color:{fc}">'
+                f'{info["avg_bps"]:+.1f}<span style="font-size:0.8rem"> bps/hr</span></span><br>'
+                f'<span style="font-size:0.75rem;color:{fc}">{label}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
-
-        # ---------------------------------------------------------------
-        # ASIA SESSION DEEP DIVE
-        # ---------------------------------------------------------------
         st.markdown("---")
-        st.subheader("🌏 Asia Session Deep Dive")
-        st.caption("Asia isn't uniformly bearish. The desk needs to know WHEN Asia is tradeable.")
 
-        # Sub-session breakdown
-        col_a1, col_a2 = st.columns(2)
+        # Hourly return + volatility charts
+        now_h     = utc_now.hour
+        hourly_ret = df.groupby("hour")["return"].mean() * 10000
+        hourly_vol = df.groupby("hour")["abs_return"].mean() * 100
 
-        with col_a1:
-            st.markdown("#### Asia Sub-Sessions")
-            early = df[df["hour"].isin([0, 1, 2, 3])]["return"].mean() * 10000
-            late = df[df["hour"].isin([4, 5, 6, 7])]["return"].mean() * 10000
-            st.markdown(f"""<div style="background:#ffebee;padding:12px;border-radius:8px;margin-bottom:8px">
-            <b>Early Asia</b> (00-04 UTC / 8pm-12am ET): <span style="color:#d32f2f;font-size:18px"><b>{early:+.1f} bps/hr</b></span><br>
-            <small>This is where Late NYC momentum dies. 00:00 and 01:00 UTC are the worst hours.</small>
-            </div>""", unsafe_allow_html=True)
-            st.markdown(f"""<div style="background:#fff8e1;padding:12px;border-radius:8px">
-            <b>Late Asia</b> (04-08 UTC / 12am-4am ET): <span style="color:#f57f17;font-size:18px"><b>{late:+.1f} bps/hr</b></span><br>
-            <small>04:00 and 05:00 UTC are actually positive. 07:00 UTC dumps ahead of London.</small>
-            </div>""", unsafe_allow_html=True)
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            st.markdown("#### Avg Return by Hour (UTC)")
+            r_colors = ["#66bb6a" if v > 5 else "#e57373" if v < -10 else "#90a4ae"
+                        for v in hourly_ret]
+            fig_r = go.Figure(go.Bar(x=hourly_ret.index, y=hourly_ret.values,
+                                     marker_color=r_colors))
+            fig_r.add_vline(x=now_h, line_color="#ffeb3b", line_width=2,
+                            annotation_text=f"NOW ({now_h:02d}h)")
+            # Session shading
+            fig_r.add_vrect(x0=-0.5, x1=7.5,  fillcolor="blue",   opacity=0.04)
+            fig_r.add_vrect(x0=7.5,  x1=12.5, fillcolor="green",  opacity=0.04)
+            fig_r.add_vrect(x0=12.5, x1=20.5, fillcolor="orange", opacity=0.04)
+            fig_r.add_vrect(x0=20.5, x1=23.5, fillcolor="purple", opacity=0.04)
+            fig_r.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Hour (UTC)", yaxis_title="bps",
+                xaxis=dict(dtick=1), margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
 
-        with col_a2:
-            st.markdown("#### Asia by Day of Week")
-            day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            day_vals = [ASIA_DAY_BPS[d] for d in day_order]
-            colors = ["#388e3c" if v > 0 else "#d32f2f" for v in day_vals]
-            fig_day = go.Figure(go.Bar(x=day_order, y=day_vals, marker_color=colors,
-                                       text=[f"{v:+.0f}" for v in day_vals], textposition="outside"))
-            fig_day.add_hline(y=0, line_color="black", line_width=0.5)
-            fig_day.update_layout(height=250, yaxis_title="Avg bps/hr",
-                                  title="Mon/Wed/Fri = tradeable | Thu/Sat/Sun = toxic")
+        with ch2:
+            st.markdown("#### Volatility by Hour (Avg |Move|%)")
+            fig_v = go.Figure(go.Bar(x=hourly_vol.index, y=hourly_vol.values,
+                                     marker_color="#ffb74d"))
+            fig_v.add_vline(x=now_h, line_color="#ffeb3b", line_width=2,
+                            annotation_text="NOW")
+            fig_v.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Hour (UTC)", yaxis_title="|Move| %",
+                xaxis=dict(dtick=1), margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_v, use_container_width=True)
+
+        # Asia deep dive
+        st.markdown("---")
+        st.markdown("#### 🌏 Asia Deep Dive")
+        a1, a2 = st.columns(2)
+        with a1:
+            early = df[df["hour"].isin([0,1,2,3])]["return"].mean() * 10000
+            late  = df[df["hour"].isin([4,5,6,7])]["return"].mean() * 10000
+            for label, val, note in [
+                ("Early Asia (00-04 UTC / 8pm-12am ET)", early,
+                 "00:00–01:00 UTC are the worst hours"),
+                ("Late Asia (04-08 UTC / 12am-4am ET)", late,
+                 "04:00–05:00 slightly positive; 07:00 UTC dumps before London"),
+            ]:
+                col = "#e57373" if val < 0 else "#66bb6a"
+                st.markdown(
+                    f'<div style="background:#1e272e;border-radius:8px;padding:12px;'
+                    f'margin-bottom:8px">'
+                    f'<b>{label}</b><br>'
+                    f'<span style="font-size:1.4rem;font-weight:800;color:{col}">'
+                    f'{val:+.1f} bps/hr</span><br>'
+                    f'<span style="font-size:0.78rem;color:#aaa">{note}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        with a2:
+            day_order = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+            day_vals  = [ASIA_DAY_BPS[d] for d in day_order]
+            fig_day = go.Figure(go.Bar(
+                x=day_order, y=day_vals,
+                marker_color=["#66bb6a" if v > 0 else "#e57373" for v in day_vals],
+                text=[f"{v:+.0f}" for v in day_vals], textposition="outside",
+            ))
+            fig_day.add_hline(y=0, line_color="#546e7a", line_width=0.5)
+            fig_day.update_layout(
+                title="Asia by Day (Mon/Wed/Fri tradeable | Thu/Sat/Sun avoid)",
+                template="plotly_dark", height=260, margin=dict(t=36, b=10),
+            )
             st.plotly_chart(fig_day, use_container_width=True)
 
-        # Carry effect
-        st.markdown("#### Late NYC Carry Effect")
-        st.markdown("""
-        | Late NYC Outcome | Next Asia Avg Return | Interpretation |
-        |-----------------|---------------------|----------------|
-        | **Strong UP (>2%)** | -0.43% | Partial give-back, but not catastrophic |
-        | **Mild UP (0-2%)** | **-1.52%** | **WORST outcome** — Asia dumps hardest after mild Late NYC gains |
-        | **Flat** | -0.43% | Normal Asia bleed |
-        | **Mild DOWN** | -0.47% | Normal Asia bleed |
-        | **Strong DOWN (<-2%)** | -0.57% | Continued selling |
-
-        **Key insight:** The carry correlation is **-0.045** (weakly negative). A strong Late NYC move does NOT predict Asia continuation.
-        The MOST dangerous setup is a mild +0-2% Late NYC — Asia gives it ALL back and then some.
-        """)
-
-        # Signal quality during Asia
-        st.markdown("#### Composite Signal Works BETTER During Asia")
-        st.markdown("""
-        | Metric | Asia Session | All Other Sessions |
-        |--------|-------------|-------------------|
-        | **IC (composite → 4h return)** | **0.075** | 0.053 |
-        | **LONG signals (>0.2) hit rate** | 57% | — |
-        | **SHORT signals (<-0.2) avg return** | **+0.83%** | — |
-
-        **Bottom line for the desk:** When you DO get a signal during Asia, trust it more than usual.
-        SHORT signals during Asia are the highest-quality trades in the entire dataset.
-        """)
-
+        # Timing playbook table
         st.markdown("---")
-
-        col_l, col_r = st.columns(2)
-
-        # --- Hourly Returns Chart ---
-        with col_l:
-            st.markdown("#### Return by Hour (UTC)")
-            hourly_ret = df.groupby("hour")["return"].mean() * 10000
-            colors = ["#388e3c" if v > 5 else "#d32f2f" if v < -10 else "#9e9e9e" for v in hourly_ret]
-
-            fig = go.Figure(go.Bar(x=hourly_ret.index, y=hourly_ret.values, marker_color=colors))
-            # Highlight current hour
-            now_h = get_current_utc().hour
-            fig.add_vline(x=now_h, line_color="blue", line_width=3, line_dash="solid",
-                          annotation_text=f"NOW ({now_h:02d}:00 UTC)")
-            fig.add_vrect(x0=-0.5, x1=7.5, fillcolor="blue", opacity=0.03)
-            fig.add_vrect(x0=7.5, x1=12.5, fillcolor="green", opacity=0.03)
-            fig.add_vrect(x0=12.5, x1=20.5, fillcolor="orange", opacity=0.03)
-            fig.add_vrect(x0=20.5, x1=23.5, fillcolor="purple", opacity=0.03)
-            fig.update_layout(height=350, xaxis_title="Hour (UTC)", yaxis_title="Avg Return (bps)",
-                              xaxis=dict(dtick=1))
-            st.plotly_chart(fig, use_container_width=True)
-
-        # --- Volatility Chart ---
-        with col_r:
-            st.markdown("#### Volatility by Hour (Where the Big Moves Are)")
-            hourly_vol = df.groupby("hour")["abs_return"].mean() * 100
-            fig2 = go.Figure(go.Bar(x=hourly_vol.index, y=hourly_vol.values, marker_color="#ff9800"))
-            fig2.add_vline(x=now_h, line_color="blue", line_width=3,
-                           annotation_text="NOW")
-            fig2.update_layout(height=350, xaxis_title="Hour (UTC)", yaxis_title="Avg |Move| (%)",
-                               xaxis=dict(dtick=1))
-            st.plotly_chart(fig2, use_container_width=True)
-
-        # --- Key Timing Rules ---
         st.markdown("#### Timing Playbook")
         st.markdown("""
-        | Rule | Detail | Your Time (ET) |
-        |------|--------|----------------|
-        | **Best entry window** | 10:00 UTC (+23.4 bps avg) | **6:00 AM ET** |
-        | **Second window** | 19:00-22:00 UTC (+15-19 bps avg) | **3-6 PM ET** |
-        | **Kill zone — AVOID** | 18:00 UTC (-26.5 bps avg) | **2:00 PM ET** |
-        | **Asia bleed — AVOID longs** | 00:00-07:00 UTC | **8 PM - 3 AM ET** |
-        | **Hold window** | 4-8 hours max | Signal decays after 8h |
-        | **Hard exit** | Composite flips sign | Immediate close |
-        | **Best days** | Mon, Tue, Fri | |
-        | **Worst days** | Thu, Sat, Sun | Dump days |
-        """)
-
-        # --- Day of Week ---
-        daily = data.get("ohlcv_daily")
-        if daily is not None:
-            st.markdown("#### Returns by Day of Week")
-            daily_c = daily.copy()
-            daily_c["return"] = daily_c["close"].pct_change()
-            daily_c["weekday"] = daily_c.index.day_name()
-            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            wd_mean = daily_c.groupby("weekday")["return"].mean().reindex(day_order) * 100
-            colors = ["#388e3c" if v > 0 else "#d32f2f" for v in wd_mean]
-            fig3 = go.Figure(go.Bar(x=[d[:3] for d in day_order], y=wd_mean.values, marker_color=colors))
-            fig3.add_hline(y=0, line_color="black", line_width=0.5)
-            # Highlight today
-            today = get_current_utc().strftime("%A")
-            fig3.update_layout(height=300, yaxis_title="Avg Return (%)",
-                               title=f"Today is {today}")
-            st.plotly_chart(fig3, use_container_width=True)
+| Rule | Detail | ET Time |
+|------|--------|---------|
+| **Best entry** | 10:00 UTC (+23.4 bps avg) | 6:00 AM |
+| **2nd window** | 19:00–22:00 UTC (+15–19 bps) | 3–6 PM |
+| **Kill zone — AVOID** | 18:00 UTC (−26.5 bps avg) | 2:00 PM |
+| **Asia bleed — AVOID longs** | 00:00–07:00 UTC | 8 PM – 3 AM |
+| **Hold window** | 4–8 hours max | Signal decays after 8h |
+| **Hard exit** | Composite flips sign | Immediate |
+| **Best days** | Mon · Tue · Fri | |
+| **Worst days** | Thu · Sat · Sun | Dump days |
+""")
 
 
-# =========================================================================
-# TAB 3: Exchange Intel
-# =========================================================================
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — EXCHANGE INTEL
+# ═════════════════════════════════════════════════════════════════════════════
 
 with tab_exchange:
     deriv = data.get("derivatives")
     if deriv is None:
         st.warning("No derivatives data.")
     else:
-        active = deriv[deriv["open_interest_usd"] > 10000].copy()
+        active = deriv[deriv["open_interest_usd"] > 10_000].copy()
+        st.subheader(f"Cross-Exchange Positioning — {len(active)} Active Venues")
 
-        st.subheader(f"Cross-Exchange Positioning — {len(active)} Active Exchanges")
+        ec1, ec2 = st.columns(2)
 
-        col_l, col_r = st.columns(2)
-
-        # --- OI Distribution ---
-        with col_l:
-            st.markdown("#### Where Is the Money? (OI)")
+        with ec1:
+            st.markdown("#### OI Distribution")
             oi_top = active.nlargest(12, "open_interest_usd")
-            fig = go.Figure(go.Bar(
-                y=oi_top["exchange"].str[:22], x=oi_top["open_interest_usd"] / 1e6,
-                orientation="h", marker_color="#1f77b4",
+            fig_oi = go.Figure(go.Bar(
+                y=oi_top["exchange"].str[:22],
+                x=oi_top["open_interest_usd"] / 1e6,
+                orientation="h", marker_color="#42a5f5",
                 text=[f"${v/1e6:.1f}M" for v in oi_top["open_interest_usd"]],
                 textposition="outside",
             ))
-            fig.update_layout(height=400, xaxis_title="OI ($M)", margin=dict(l=180))
-            st.plotly_chart(fig, use_container_width=True)
+            fig_oi.update_layout(
+                template="plotly_dark", height=420,
+                xaxis_title="OI ($M)", margin=dict(l=160, t=10),
+            )
+            st.plotly_chart(fig_oi, use_container_width=True)
 
-            total_oi = active["open_interest_usd"].sum()
-            top_2 = active.nlargest(2, "open_interest_usd")
-            top_2_share = top_2["open_interest_usd"].sum() / total_oi
-            st.metric("Top 2 Exchanges OI Share", f"{top_2_share:.0%}",
-                      delta=f"{top_2.iloc[0]['exchange'][:15]} + {top_2.iloc[1]['exchange'][:15]}")
+            total_oi_ex = active["open_interest_usd"].sum()
+            top2 = active.nlargest(2, "open_interest_usd")
+            st.metric(
+                "Top-2 OI share",
+                f"{top2['open_interest_usd'].sum()/total_oi_ex:.0%}",
+                delta=f"{top2.iloc[0]['exchange'][:12]} + {top2.iloc[1]['exchange'][:12]}",
+            )
 
-        # --- Funding Rates ---
-        with col_r:
+        with ec2:
             st.markdown("#### Funding Rate Divergence")
             fr_sorted = active.sort_values("funding_rate")
-            colors = ["#d32f2f" if x < 0 else "#388e3c" for x in fr_sorted["funding_rate"]]
-            fig2 = go.Figure(go.Bar(
-                y=fr_sorted["exchange"].str[:22], x=fr_sorted["funding_rate"],
-                orientation="h", marker_color=colors,
+            fig_fr2 = go.Figure(go.Bar(
+                y=fr_sorted["exchange"].str[:22],
+                x=fr_sorted["funding_rate"],
+                orientation="h",
+                marker_color=["#e57373" if x < 0 else "#66bb6a"
+                               for x in fr_sorted["funding_rate"]],
             ))
-            fig2.add_vline(x=0, line_color="black", line_width=1)
-            fig2.update_layout(height=max(400, len(fr_sorted) * 18), xaxis_title="Funding Rate",
-                               margin=dict(l=180))
-            st.plotly_chart(fig2, use_container_width=True)
+            fig_fr2.add_vline(x=0, line_color="#546e7a", line_width=1)
+            fig_fr2.update_layout(
+                template="plotly_dark",
+                height=max(400, len(fr_sorted) * 18),
+                xaxis_title="Funding Rate", margin=dict(l=160, t=10),
+            )
+            st.plotly_chart(fig_fr2, use_container_width=True)
 
-        # --- Churning Detection ---
-        st.markdown("#### Churning Detection (Volume / OI Ratio)")
-        st.caption("Ratio > 10x is suspicious. Could indicate wash trading or rapid position cycling.")
+        # Churning
+        st.markdown("#### Churning Detection (Vol / OI)")
+        st.caption("Ratio > 10x = suspicious. Possible wash trading or rapid position cycling.")
         active["vol_oi"] = active["volume_24h_usd"] / active["open_interest_usd"].replace(0, np.nan)
         churning = active.nlargest(10, "vol_oi")
-        fig3 = go.Figure(go.Bar(
+        fig_ch = go.Figure(go.Bar(
             y=churning["exchange"].str[:22], x=churning["vol_oi"],
             orientation="h",
-            marker_color=["#d32f2f" if v > 10 else "#ff9800" if v > 5 else "#388e3c" for v in churning["vol_oi"]],
+            marker_color=["#e57373" if v > 10 else "#ffb74d" if v > 5 else "#66bb6a"
+                          for v in churning["vol_oi"]],
             text=[f"{v:.1f}x" for v in churning["vol_oi"]], textposition="outside",
         ))
-        fig3.update_layout(height=350, xaxis_title="Volume / OI", margin=dict(l=180))
-        st.plotly_chart(fig3, use_container_width=True)
+        fig_ch.update_layout(
+            template="plotly_dark", height=340,
+            xaxis_title="Vol / OI", margin=dict(l=160, t=10),
+        )
+        st.plotly_chart(fig_ch, use_container_width=True)
 
-        # --- Full table ---
-        with st.expander("Full Exchange Data"):
-            display_df = active[["exchange", "funding_rate", "open_interest_usd", "volume_24h_usd",
-                                 "basis_pct", "spread", "price"]].sort_values("open_interest_usd", ascending=False)
+        with st.expander("Full Exchange Table"):
+            display_df = active[[
+                "exchange","funding_rate","open_interest_usd",
+                "volume_24h_usd","basis_pct","spread","price",
+            ]].sort_values("open_interest_usd", ascending=False)
             st.dataframe(display_df.style.format({
                 "funding_rate": "{:.6f}", "open_interest_usd": "${:,.0f}",
                 "volume_24h_usd": "${:,.0f}", "basis_pct": "{:.4f}%",
@@ -732,92 +828,97 @@ with tab_exchange:
             }), use_container_width=True, height=500)
 
 
-# =========================================================================
-# TAB 4: BTC Context
-# =========================================================================
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — BTC CONTEXT
+# ═════════════════════════════════════════════════════════════════════════════
 
 with tab_btc:
-    btc = data.get("btc")
+    btc  = data.get("btc")
     ohlcv = data.get("ohlcv")
 
-    if btc is not None and ohlcv is not None:
-        btc_col = "price" if "price" in btc.columns else "close"
+    if btc is None or ohlcv is None:
+        st.warning("Missing BTC or FART data.")
+    else:
+        btc_col  = "price" if "price" in btc.columns else "close"
         fart_col = "price" if "price" in ohlcv.columns else "close"
 
-        btc_h = btc[[btc_col, "volume"]].resample("1h").last().dropna()
-        btc_h.columns = ["btc_price", "btc_volume"]
+        btc_h  = btc[[btc_col,"volume"]].resample("1h").last().dropna()
+        btc_h.columns = ["btc_price","btc_volume"]
         btc_h["btc_return"] = btc_h["btc_price"].pct_change()
 
         fart_h = ohlcv[[fart_col]].resample("1h").last().dropna()
         fart_h.columns = ["fart_price"]
         fart_h["fart_return"] = fart_h["fart_price"].pct_change()
 
-        merged = btc_h.join(fart_h, how="inner").dropna(subset=["btc_return", "fart_return"])
-        corr = merged["btc_return"].corr(merged["fart_return"])
-        valid = merged[["btc_return", "fart_return"]].dropna()
-        beta = np.polyfit(valid["btc_return"], valid["fart_return"], 1)[0] if len(valid) > 50 else 0
+        merged = btc_h.join(fart_h, how="inner").dropna(subset=["btc_return","fart_return"])
+        corr   = merged["btc_return"].corr(merged["fart_return"])
+        valid  = merged[["btc_return","fart_return"]].dropna()
+        beta   = np.polyfit(valid["btc_return"], valid["fart_return"], 1)[0] if len(valid) > 50 else 0
         merged["rolling_corr"] = merged["btc_return"].rolling(24).corr(merged["fart_return"])
 
-        # Top metrics
-        st.subheader("BTC-FART Relationship")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Correlation", f"{corr:.3f}")
-        col2.metric("Beta", f"{beta:.2f}x")
-        col3.metric("BTC Regime", mkt.get("btc_regime", "?"))
-        col4.metric("BTC 24h", f"{mkt.get('btc_ret_24h', 0):.1%}")
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric("Correlation", f"{corr:.3f}")
+        bm2.metric("Beta", f"{beta:.2f}x")
+        bm3.metric("BTC Regime", mkt.get("btc_regime","?"))
+        bm4.metric("BTC 24h", f"{mkt.get('btc_ret_24h',0):.1%}")
 
-        st.markdown(f"""
-        **What this means for trading:**
-        - FART moves **{beta:.1f}x** BTC on average. A 1% BTC move → ~{beta:.1f}% FART move.
-        - When BTC and FART **decorrelate**, FART moves are **2.5x bigger** than normal → **manipulation signal**.
-        - BTC dumps: FART falls {beta:.1f}x harder. BTC rallies: FART pumps {beta:.1f}x harder.
-        - Late NYC session (5-8pm ET) has the highest beta (1.94x) — most leveraged to BTC.
-        """)
+        st.info(
+            f"FART moves **{beta:.1f}x** BTC on average. "
+            f"When correlation goes negative, moves are **2.5x bigger** — manipulation signal."
+        )
 
-        col_l, col_r = st.columns(2)
-
-        with col_l:
-            st.markdown("#### Price Overlay (Normalized)")
-            btc_norm = merged["btc_price"] / merged["btc_price"].iloc[0] * 100
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.markdown("#### Normalized Price Overlay")
+            btc_norm  = merged["btc_price"]  / merged["btc_price"].iloc[0]  * 100
             fart_norm = merged["fart_price"] / merged["fart_price"].iloc[0] * 100
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=merged.index, y=btc_norm, name="BTC",
-                                     line=dict(color="#f7931a", width=2)))
-            fig.add_trace(go.Scatter(x=merged.index, y=fart_norm, name="FART",
-                                     line=dict(color="#1f77b4", width=2)))
-            fig.update_layout(height=350, yaxis_title="Indexed (100=start)", hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True)
+            fig_ov = go.Figure()
+            fig_ov.add_trace(go.Scatter(x=merged.index, y=btc_norm,
+                                        name="BTC", line=dict(color="#f7931a", width=2)))
+            fig_ov.add_trace(go.Scatter(x=merged.index, y=fart_norm,
+                                        name="FART", line=dict(color="#42a5f5", width=2)))
+            fig_ov.update_layout(
+                template="plotly_dark", height=320,
+                yaxis_title="Indexed (start=100)", hovermode="x unified",
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_ov, use_container_width=True)
 
-        with col_r:
-            st.markdown("#### Rolling Correlation (Decorrelation = MM Activity)")
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=merged.index, y=merged["rolling_corr"],
-                                      line=dict(color="#1f77b4", width=1)))
-            fig2.add_hline(y=0, line_color="red", line_dash="dash")
-            fig2.add_hrect(y0=-1, y1=0, fillcolor="red", opacity=0.07)
-            fig2.update_layout(height=350, yaxis_title="24h Correlation", yaxis_range=[-1, 1])
-            st.plotly_chart(fig2, use_container_width=True)
+        with bc2:
+            st.markdown("#### Rolling 24h Correlation")
+            fig_rc = go.Figure()
+            fig_rc.add_trace(go.Scatter(x=merged.index, y=merged["rolling_corr"],
+                                        line=dict(color="#42a5f5", width=1.5)))
+            fig_rc.add_hline(y=0, line_color="#e57373", line_dash="dash")
+            fig_rc.add_hrect(y0=-1, y1=0, fillcolor="#e57373", opacity=0.05)
+            fig_rc.update_layout(
+                template="plotly_dark", height=320,
+                yaxis_title="24h Correlation", yaxis_range=[-1,1],
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_rc, use_container_width=True)
 
-        # --- BTC Regime Table ---
-        st.markdown("#### How FART Behaves in Each BTC Environment")
+        # Regime table
+        st.markdown("#### FART Behavior by BTC Regime")
         merged["btc_ret_24h"] = merged["btc_price"].pct_change(24)
 
-        def regime(r):
+        def _regime(r):
             if pd.isna(r): return None
-            if r > 0.03: return "BTC Strong Rally (>3%)"
-            if r > 0.01: return "BTC Mild Rally (1-3%)"
-            if r > -0.01: return "BTC Flat (-1% to 1%)"
-            if r > -0.03: return "BTC Mild Dump (-3 to -1%)"
-            return "BTC Strong Dump (<-3%)"
+            if r >  0.03: return "BTC Strong Rally (>3%)"
+            if r >  0.01: return "BTC Mild Rally (1-3%)"
+            if r > -0.01: return "BTC Flat (−1%→1%)"
+            if r > -0.03: return "BTC Mild Dump (−3→−1%)"
+            return "BTC Strong Dump (<−3%)"
 
-        merged["regime"] = merged["btc_ret_24h"].apply(regime)
-        regime_order = ["BTC Strong Rally (>3%)", "BTC Mild Rally (1-3%)", "BTC Flat (-1% to 1%)",
-                        "BTC Mild Dump (-3 to -1%)", "BTC Strong Dump (<-3%)"]
+        merged["regime"] = merged["btc_ret_24h"].apply(_regime)
+        regime_order = [
+            "BTC Strong Rally (>3%)", "BTC Mild Rally (1-3%)",
+            "BTC Flat (−1%→1%)", "BTC Mild Dump (−3→−1%)", "BTC Strong Dump (<−3%)",
+        ]
         regime_stats = merged.groupby("regime").agg(
             avg_fart_bps=("fart_return", lambda x: x.mean() * 10000),
             observations=("fart_return", "count"),
         ).reindex(regime_order).dropna()
-
         regime_stats["action"] = [
             "✅ LONG bias — tailwind",
             "✅ Mild long bias",
@@ -825,81 +926,84 @@ with tab_btc:
             "⚠️ Caution on longs",
             "⛔ AVOID longs — 1.6x downside beta",
         ][:len(regime_stats)]
-
         st.dataframe(regime_stats, use_container_width=True)
-    else:
-        st.warning("Missing BTC or FART data.")
 
 
-# =========================================================================
-# TAB 5: Trade Rules
-# =========================================================================
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 6 — TRADE RULES
+# ═════════════════════════════════════════════════════════════════════════════
 
 with tab_rules:
-    st.subheader("Trade Execution Rules")
+    c_l, c_r = st.columns(2)
 
-    st.markdown("""
-    ### Entry Rules
+    with c_l:
+        st.markdown("""
+### Entry Rules
 
-    | Condition | Threshold | Notes |
-    |-----------|-----------|-------|
-    | **Composite signal** | > +0.4 for LONG, < -0.4 for SHORT | Primary trigger. 88% hit rate at 0.4 (4h window) |
-    | **Medium conviction** | +0.3 to +0.4 / -0.3 to -0.4 | 65% hit rate — use with confirming factors |
-    | **Low conviction** | +0.2 to +0.3 / -0.2 to -0.3 | Only trade with session + BTC alignment |
+| Composite | Conviction | Notes |
+|-----------|------------|-------|
+| > +0.4 / < −0.4 | HIGH | Primary trigger. 88% hit rate (4h) |
+| +0.3→0.4 / −0.3→−0.4 | MEDIUM | 65% hit rate — use with confirming factors |
+| +0.2→0.3 / −0.2→−0.3 | LOW | Only with session + BTC alignment |
 
-    ### Timing Filters (MUST pass before entry)
+### Timing Filters
 
-    | Filter | Rule | Reason |
-    |--------|------|--------|
-    | **Session** | Prefer London (4-9am ET) or Late NYC (5-8pm ET) | Best historical returns |
-    | **Asia — conditional** | Longs OK on Mon/Wed/Fri in Late Asia (12am-4am ET). Avoid Thu/Sat/Sun Asia entirely. SHORT signals during Asia are highest quality. | See Asia Deep Dive |
-    | **Kill zone** | No new entries at 2pm ET (18:00 UTC) | Worst single hour (-26.5 bps) |
-    | **Day of week** | Prefer Mon/Tue/Fri | Thu/Sat/Sun are dump days |
+| Filter | Rule |
+|--------|------|
+| **Session** | Prefer London or Late NYC |
+| **Asia** | Longs OK Mon/Wed/Fri Late Asia. SHORT signals = highest quality. |
+| **Kill zone** | No new entries at 18:00 UTC (2pm ET) |
+| **Day of week** | Prefer Mon/Tue/Fri |
 
-    ### Conviction Modifiers
+### Exit Rules
 
-    | Factor | Upgrades | Downgrades |
-    |--------|----------|------------|
-    | **Funding rate** | Aligns with direction (neg funding + long) | Opposes direction (pos funding + long) |
-    | **BTC regime** | Rally + long, or Dump + short | Dump + long, or Rally + short |
-    | **Session** | London or Late NYC | Asia |
-    | **Volume spike** | Volume > 2x avg (positioning) | — |
+| Condition | Action |
+|-----------|--------|
+| 4–8 hours elapsed | Close position |
+| Composite flips sign | Immediate close |
+| Hit 18:00 UTC | Close or tighten stop |
+| 24h hold | MUST close — signal reverses |
+""")
 
-    ### Exit Rules
+    with c_r:
+        st.markdown("""
+### Conviction Modifiers
 
-    | Condition | Action |
-    |-----------|--------|
-    | **4-8 hours elapsed** | Close position. Signal decays after 8h. |
-    | **Composite flips sign** | Immediate close. Signal reversed. |
-    | **Hit 18:00 UTC (2pm ET)** | Close or tighten stop. Kill zone. |
-    | **24h hold** | MUST close. Signal goes negative after 24h (mean reversion). |
+| Factor | Upgrades | Downgrades |
+|--------|----------|------------|
+| Funding | Aligns with direction | Opposes direction |
+| BTC regime | Rally+long / Dump+short | Dump+long / Rally+short |
+| Session | London / Late NYC | Asia |
+| Volume spike | Vol > 2× avg | — |
 
-    ### Risk Management
+### Risk Management
 
-    | Rule | Detail |
-    |------|--------|
-    | **Position sizing** | Scale with conviction: HIGH = full size, MED = 50%, LOW = 25% |
-    | **Stop loss** | -3% from entry (big moves average 5-7%, stops need room) |
-    | **Take profit** | +1% at 4h (avg return at high conviction), trail from there |
-    | **Correlation break** | If 24h BTC correlation goes negative, reduce position 50% — MM activity likely |
-    | **Manipulation cycle** | After 2-3 quiet days + sudden pump > 10%, expect reversal next day. Fade it. |
+| Rule | Detail |
+|------|--------|
+| **Position sizing** | HIGH = full, MED = 50%, LOW = 25% |
+| **Stop loss** | −3% from entry |
+| **Take profit** | +1% at 4h, trail from there |
+| **Correlation break** | 24h corr goes negative → cut 50% |
 
-    ### The MM Playbook (What We're Trading Against)
+### The MM Playbook
 
-    1. **Accumulate** — MMs build positions during quiet periods (low volume, 2-3 days)
-    2. **Engineer** — Push price on thin order books (usually during Asia or 2pm ET)
-    3. **Cascade** — Trigger liquidations (leveraged positions get wiped)
-    4. **Harvest** — Exit the other side at inflated/deflated prices
-    5. **Reset** — Price mean-reverts within 24h. MMs re-enter.
+1. **Accumulate** — quiet period (2-3 days low volume)
+2. **Engineer** — push price on thin books (Asia or 2pm ET)
+3. **Cascade** — trigger liquidations
+4. **Harvest** — exit at inflated/deflated prices
+5. **Reset** — mean-reverts within 24h
 
-    **Our edge:** We detect Stage 1-2 via the composite signal and enter BEFORE the cascade.
-    Signal has 50 bps quintile spread and 88% hit rate at high conviction over 4h.
-    """)
+**Our edge:** detect Stage 1–2 via composite, enter BEFORE the cascade.
+Signal: 50 bps quintile spread, 88% hit rate at high conviction.
+""")
 
 
-# =========================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Footer
-# =========================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown("---")
-st.caption(f"Last data refresh: check data/ timestamps | UTC now: {get_current_utc().strftime('%Y-%m-%d %H:%M')} | Not financial advice.")
+st.caption(
+    f"UTC {utc_now.strftime('%Y-%m-%d %H:%M')} | "
+    f"Auto-refreshes every 5 min | Not financial advice."
+)

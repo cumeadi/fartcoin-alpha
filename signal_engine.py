@@ -66,6 +66,50 @@ def load_data(perp_symbol="FARTCOINUSDT", cmc_symbol="FARTCOIN",
         data["derivatives_history"] = pd.read_csv(hist_file, parse_dates=["timestamp"])
         print(f"  Loaded derivatives history: {len(data['derivatives_history'])} snapshots")
 
+    # BTC hourly chart (for correlation / lead-lag analysis)
+    btc_file = DATA_DIR / "bitcoin_cg_chart.csv"
+    if btc_file.exists():
+        data["btc"] = pd.read_csv(btc_file, index_col=0, parse_dates=True)
+        print(f"  Loaded BTC chart: {len(data['btc'])} rows")
+
+    # --- External data sources ---
+
+    # News sentiment (CryptoPanic hourly aggregates)
+    news_file = DATA_DIR / "news_sentiment_hourly.csv"
+    if news_file.exists():
+        data["news_sentiment"] = pd.read_csv(news_file, index_col=0, parse_dates=True)
+        print(f"  Loaded news sentiment: {len(data['news_sentiment'])} rows")
+
+    # Holder concentration history (Helius)
+    holder_file = DATA_DIR / "holder_concentration_history.csv"
+    if holder_file.exists():
+        data["holder_concentration"] = pd.read_csv(holder_file, parse_dates=["snapshot_time"])
+        print(f"  Loaded holder concentration: {len(data['holder_concentration'])} snapshots")
+
+    # Exchange flow history (Helius)
+    flow_file = DATA_DIR / "exchange_flow_history.csv"
+    if flow_file.exists():
+        data["exchange_flow"] = pd.read_csv(flow_file, parse_dates=["snapshot_time"])
+        print(f"  Loaded exchange flow: {len(data['exchange_flow'])} snapshots")
+
+    # Coinalyze multi-exchange liquidations
+    liq_file = DATA_DIR / "coinalyze_liquidations.csv"
+    if liq_file.exists():
+        data["liquidations"] = pd.read_csv(liq_file, index_col=0, parse_dates=True)
+        print(f"  Loaded liquidations: {len(data['liquidations'])} rows")
+
+    # Coinalyze cross-exchange funding
+    cx_funding_file = DATA_DIR / "coinalyze_funding_history.csv"
+    if cx_funding_file.exists():
+        data["cross_exchange_funding"] = pd.read_csv(cx_funding_file, index_col=0, parse_dates=True)
+        print(f"  Loaded cross-exchange funding: {len(data['cross_exchange_funding'])} rows")
+
+    # Coinalyze predicted funding
+    pred_file = DATA_DIR / "coinalyze_predicted_funding.csv"
+    if pred_file.exists():
+        data["predicted_funding"] = pd.read_csv(pred_file, index_col=0, parse_dates=True)
+        print(f"  Loaded predicted funding: {len(data['predicted_funding'])} rows")
+
     return data
 
 

@@ -140,7 +140,7 @@ def _project_probabilistic_return(data, state):
 
     # Predict for current state
     x_now = _build_feature_matrix(df.iloc[-1:], for_prediction=True, state=state)
-    prob = float(_logistic(x_now @ theta))
+    prob = float(_logistic(x_now @ theta).ravel()[0])
 
     # Expected magnitude: session-specific volatility × sqrt(horizon)
     session = state.get("session", "NYC")

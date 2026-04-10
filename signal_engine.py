@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 from pathlib import Path
+from datetime import datetime, timezone
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -109,6 +110,42 @@ def load_data(perp_symbol="FARTCOINUSDT", cmc_symbol="FARTCOIN",
     if pred_file.exists():
         data["predicted_funding"] = pd.read_csv(pred_file, index_col=0, parse_dates=True)
         print(f"  Loaded predicted funding: {len(data['predicted_funding'])} rows")
+
+    # Coinglass OI momentum snapshots
+    cg_oi_file = DATA_DIR / "coinglass_oi_snapshot.csv"
+    if cg_oi_file.exists():
+        data["coinglass_oi"] = pd.read_csv(cg_oi_file, parse_dates=["timestamp"])
+        print(f"  Loaded Coinglass OI snapshots: {len(data['coinglass_oi'])} rows")
+
+    # Coinglass cross-exchange funding snapshots
+    cg_fund_file = DATA_DIR / "coinglass_funding_snapshot.csv"
+    if cg_fund_file.exists():
+        data["coinglass_funding"] = pd.read_csv(cg_fund_file, parse_dates=["timestamp"])
+        print(f"  Loaded Coinglass funding snapshots: {len(data['coinglass_funding'])} rows")
+
+    # Coinglass liquidation snapshots
+    cg_liq_file = DATA_DIR / "coinglass_liquidation_snapshot.csv"
+    if cg_liq_file.exists():
+        data["coinglass_liquidations"] = pd.read_csv(cg_liq_file, parse_dates=["timestamp"])
+        print(f"  Loaded Coinglass liquidation snapshots: {len(data['coinglass_liquidations'])} rows")
+
+    # DexScreener liquidity history
+    dex_file = DATA_DIR / "dex_history.csv"
+    if dex_file.exists():
+        data["dex_history"] = pd.read_csv(dex_file, parse_dates=["timestamp"])
+        data["dex_history"].set_index("timestamp", inplace=True)
+        if data["dex_history"].index.tz is not None:
+            data["dex_history"].index = data["dex_history"].index.tz_localize(None)
+        print(f"  Loaded DEX history: {len(data['dex_history'])} rows")
+
+    # Orderbook history
+    ob_file = DATA_DIR / "orderbook_history.csv"
+    if ob_file.exists():
+        data["orderbook"] = pd.read_csv(ob_file, parse_dates=["timestamp"])
+        data["orderbook"].set_index("timestamp", inplace=True)
+        if data["orderbook"].index.tz is not None:
+            data["orderbook"].index = data["orderbook"].index.tz_localize(None)
+        print(f"  Loaded Orderbook history: {len(data['orderbook'])} rows")
 
     return data
 
@@ -295,17 +332,131 @@ def signal_price_volume_divergence(ohlcv_df, lookback=10):
 
 
 # ---------------------------------------------------------------------------
+# Signal 8: DEX Liquidity Divergence
+# ---------------------------------------------------------------------------
+# CEX Open Interest is building up while on-chain DEX liquidity is pulled.
+# This divergence suggests market makers are reducing organic liquidity
+# on-chain before initiating a sharp squeeze, likely fueled by CEX leverage.
+
+def signal_dex_liquidity(dex_df, oi_df, lookback=12):
+    """Score based on divergence between CEX OI and DEX Liquidity."""
+    if dex_df is None or dex_df.empty or oi_df is None or oi_df.empty:
+        return pd.Series(dtype=float)
+
+    # Resample to match indices
+    liq = dex_df["total_dex_liquidity_usd"].resample("1h").last().ffill()
+    oi = oi_df["sumOpenInterestValue"].resample("1h").last().ffill()
+    
+    common = liq.index.intersection(oi.index)
+    if len(common) < lookback + 1:
+        return pd.Series(dtype=float)
+        
+    liq = liq.loc[common]
+    oi = oi.loc[common]
+
+    liq_pct = liq.pct_change(lookback).fillna(0)
+    oi_pct = oi.pct_change(lookback).fillna(0)
+    
+    # If OI is up strong (>5%) and Liquidity is down strong (< -5%), that's bullish manipulation (squeeze set up)
+    # The divergence score: OI_pct - Liq_pct
+    # High divergence (OI up, Liq down) = high squeeze risk = long signal
+    divergence = oi_pct - liq_pct
+    
+    # Normalize with z-score
+    div_mean = divergence.rolling(lookback).mean()
+    div_std = divergence.rolling(lookback).std().replace(0, np.nan)
+    z = (divergence - div_mean) / div_std
+    
+    signal = z.clip(-3, 3) / 3
+    signal.name = "sig_dex_liq_div"
+    return signal
+
+
+# ---------------------------------------------------------------------------
+# Signal 9: Orderbook Imbalance (Spoofing)
+# ---------------------------------------------------------------------------
+# Detects extreme limit order imbalances. If Ask depth is substantially
+# higher than Bid depth, MMs might be setting fake walls (spoofing) to
+# manipulate price down, creating a bearish signal. Vice versa for bids.
+
+def signal_orderbook_imbalance(ob_df, lookback=12):
+    """Score based on z-score of ±2% orderbook imbalance."""
+    if ob_df is None or ob_df.empty:
+        return pd.Series(dtype=float)
+
+    # Use the 2% imbalance: Bid Depth / Ask Depth
+    imbalance = ob_df["imbalance_2pct"].resample("1h").last().ffill()
+    
+    # If imbalance is very high (bids >> asks), strong bullish fake wall = bearish signal to fade it, 
+    # OR conversely if it's spoofing, they pull the bids. Wait.
+    # Actually, spoof bids (high imbalance) = creating fake support = price ultimately dumps when pulled.
+    # Therefore, high bid imbalance -> bearish score (-). High ask imbalance -> bullish score (+).
+    
+    # Let's take z-score of log imbalance to handle ratio skewness
+    log_imb = np.log(imbalance.clip(lower=0.01))
+    
+    imb_mean = log_imb.rolling(lookback).mean()
+    imb_std = log_imb.rolling(lookback).std().replace(0, np.nan)
+    z = (log_imb - imb_mean) / imb_std
+    
+    # High bid wall (z > 0) means fade the bids -> signal < 0
+    signal = -z.clip(-3, 3) / 3
+    signal.name = "sig_ob_imbalance"
+    return signal
+
+
+# ---------------------------------------------------------------------------
+# Signal 10: Weekend Liquidity Drain
+# ---------------------------------------------------------------------------
+# Weekend liquidity is naturally thinner, but if MMs PULL liquidity (CEX or DEX)
+# while price is at a local peak, it's a strong signal for a weekend dump.
+# Conversely, if they dump and then PULL liquidity on the lows, it complicates
+# the bounce. 
+
+def signal_weekend_liquidity(dex_df, is_weekend=False, lookback=48):
+    """
+    Score based on current DEX liquidity vs pre-weekend (lookback) average.
+    Only active during the weekend. 
+    Liquidity dropping >10% during weekend = BEARISH manipulation flag.
+    """
+    if dex_df is None or dex_df.empty or not is_weekend:
+        return pd.Series(dtype=float)
+
+    liq = dex_df["total_dex_liquidity_usd"].resample("1h").last().ffill()
+    
+    # Pre-weekend benchmark (last 'lookback' hours)
+    benchmark = liq.iloc[-lookback-1:-1].mean()
+    current = liq.iloc[-1]
+    
+    if benchmark == 0 or np.isnan(benchmark):
+        return pd.Series(dtype=float)
+
+    drain = (current - benchmark) / benchmark
+    
+    # If drain < -0.1 (10% drop), that's bearish manipulation
+    # Normalized: -10% -> -0.5 score, -20% -> -1.0 score
+    score = np.clip(drain / 0.2, -1.0, 1.0)
+    
+    signal = pd.Series(score, index=[liq.index[-1]])
+    signal.name = "sig_weekend_liq"
+    return signal
+
+
+# ---------------------------------------------------------------------------
 # Composite Signal
 # ---------------------------------------------------------------------------
 
 DEFAULT_WEIGHTS = {
-    "sig_funding": 0.20,       # Funding rate extremes
-    "sig_oi_divergence": 0.20, # OI building without price move
-    "sig_oi_accel": 0.15,      # OI acceleration spikes
-    "sig_lsr": 0.15,           # Contrarian long/short
-    "sig_taker": 0.15,         # Taker aggression
+    "sig_funding": 0.15,       # Funding rate extremes
+    "sig_oi_divergence": 0.15, # OI building without price move
+    "sig_oi_accel": 0.10,      # OI acceleration spikes
+    "sig_lsr": 0.10,           # Contrarian long/short
+    "sig_taker": 0.10,         # Taker aggression
     "sig_volume_spike": 0.05,  # Volume anomalies (directionally ambiguous)
     "sig_pv_divergence": 0.10, # Price-volume divergence
+    "sig_dex_liq_div": 0.10,   # DEX liquidity vs CEX OI divergence
+    "sig_ob_imbalance": 0.10,  # Spoof walls in limit orderbook
+    "sig_weekend_liq": 0.10,   # Weekend liquidity drain manipulation
 }
 
 
@@ -328,7 +479,7 @@ def compute_composite(signals_df, weights=None):
     return composite
 
 
-def compute_all_signals(data):
+def compute_all_signals(data, is_weekend=False):
     """Run all signal functions on loaded data, return combined DataFrame."""
     signals = []
 
@@ -350,6 +501,15 @@ def compute_all_signals(data):
     if "ohlcv" in data:
         signals.append(signal_volume_spike(data["ohlcv"]))
         signals.append(signal_price_volume_divergence(data["ohlcv"]))
+
+    if "dex_history" in data and "oi" in data:
+        signals.append(signal_dex_liquidity(data["dex_history"], data["oi"]))
+
+    if "orderbook" in data:
+        signals.append(signal_orderbook_imbalance(data["orderbook"]))
+
+    if "dex_history" in data:
+        signals.append(signal_weekend_liquidity(data["dex_history"], is_weekend=is_weekend))
 
     # Combine all signals on a common index
     signals = [s for s in signals if not s.empty]
@@ -432,7 +592,9 @@ if __name__ == "__main__":
     data = load_data()
 
     print("\nComputing signals...")
-    signals = compute_all_signals(data)
+    from market_state import is_weekend as check_weekend
+    is_we = check_weekend(datetime.now(timezone.utc))
+    signals = compute_all_signals(data, is_weekend=is_we)
 
     if not signals.empty:
         signals.to_csv(DATA_DIR / "signals.csv")

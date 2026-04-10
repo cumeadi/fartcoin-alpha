@@ -26,16 +26,17 @@ from market_state import (
 )
 from projections import compute_projections
 from alerts import evaluate_alerts, evaluate_projection_alerts
+from coin_config import COIN_CONFIG, DEFAULT_COIN
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="FART Trade Desk",
+    page_title="Alpha Trade Desk",
     page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # Inject a tighter global style
@@ -61,25 +62,43 @@ st_autorefresh(interval=300_000, key="data_refresh")
 
 utc_now = datetime.now(timezone.utc)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Coin selector (sidebar)
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### Coin")
+    _coin_options = list(COIN_CONFIG.keys())
+    selected_coin = st.selectbox(
+        "Select coin",
+        _coin_options,
+        index=_coin_options.index(DEFAULT_COIN),
+        label_visibility="collapsed",
+    )
+
+_cfg        = COIN_CONFIG[selected_coin]
+_cmc_sym    = _cfg["cmc_symbol"]
+_perp_sym   = _cfg["perp_symbol"]
+_disp_name  = _cfg["display_name"]
+_emoji      = _cfg["emoji"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading  (includes all external collector files)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
-def load_all_data():
+def load_all_data(cmc_sym, perp_sym):
     data = {}
 
     # Core files (index = timestamp)
     index_files = {
-        "ohlcv":              "FARTCOIN_ohlcv_hourly.csv",
-        "ohlcv_daily":        "FARTCOIN_ohlcv.csv",
+        "ohlcv":              f"{cmc_sym}_ohlcv_hourly.csv",
+        "ohlcv_daily":        f"{cmc_sym}_ohlcv.csv",
         "btc":                "bitcoin_cg_chart.csv",
-        "funding":            "FARTCOINUSDT_funding.csv",
-        "lsr":                "FARTCOINUSDT_lsr.csv",
-        "oi":                 "FARTCOINUSDT_oi.csv",
-        "taker":              "FARTCOINUSDT_taker.csv",
-        "signals":            "signals.csv",
+        "funding":            f"{perp_sym}_funding.csv",
+        "lsr":                f"{perp_sym}_lsr.csv",
+        "oi":                 f"{perp_sym}_oi.csv",
+        "taker":              f"{perp_sym}_taker.csv",
+        "signals":            f"signals_{cmc_sym}.csv",
         # External collector files
         "news_sentiment":         "news_sentiment_hourly.csv",
         "holder_concentration":   "holder_concentration_history.csv",
@@ -101,7 +120,7 @@ def load_all_data():
 
     # Flat CSV files (no datetime index)
     flat_files = {
-        "derivatives": "FARTCOIN_derivatives_snapshot.csv",
+        "derivatives": f"{cmc_sym}_derivatives_snapshot.csv",
         "trades":      "trades.csv",
     }
     for key, fname in flat_files.items():
@@ -115,7 +134,7 @@ def load_all_data():
     return data
 
 
-data = load_all_data()
+data = load_all_data(_cmc_sym, _perp_sym)
 
 # Computed state
 mkt    = compute_market_state(data)
@@ -128,7 +147,7 @@ _proj_alerts = evaluate_projection_alerts(proj, mkt)
 all_alerts   = _sig_alerts + _proj_alerts
 
 # Data freshness
-_signals_file = DATA_DIR / "signals.csv"
+_signals_file = DATA_DIR / f"signals_{_cmc_sym}.csv"
 _data_age_min = None
 if _signals_file.exists():
     _mtime = datetime.fromtimestamp(os.path.getmtime(_signals_file), tz=timezone.utc)
@@ -182,18 +201,14 @@ if _data_age_min is not None:
     else:
         freshness_html = f'<span style="font-size:0.75rem;color:#ff8f00">⚠ Data {_data_age_min:.0f}m old</span>'
 
+_weekend_badge = "<span style='background:#ff8f00;padding:2px 8px;border-radius:4px;font-size:0.8rem;margin-left:10px'>WEEKEND MODE</span>" if mkt.get("is_weekend") else ""
 st.markdown(
-    f"""<div style="background:{_banner_color};color:white;padding:14px 20px;
-    border-radius:10px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
-    <div>
-      <span style="font-size:1.5rem;font-weight:800">{_dir_icon} {direction} — {conviction} CONVICTION</span>
-      <span style="margin-left:20px;font-size:0.95rem;opacity:0.9">{action['timing']}</span>
-    </div>
-    <div style="text-align:right;font-size:0.8rem;opacity:0.85">
-      {freshness_html}<br>
-      {utc_now.strftime('%H:%M UTC')}
-    </div>
-    </div>""",
+    f'<div style="background:{_banner_color};color:white;padding:14px 20px;border-radius:10px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">'
+    f'<div><span style="font-size:1.5rem;font-weight:800">{_dir_icon} {direction} — {conviction} CONVICTION</span>'
+    f'{_weekend_badge}'
+    f'<span style="margin-left:20px;font-size:0.95rem;opacity:0.9">{action["timing"]}</span></div>'
+    f'<div style="text-align:right;font-size:0.8rem;opacity:0.85">{freshness_html}<br>{utc_now.strftime("%H:%M UTC")}</div>'
+    f'</div>',
     unsafe_allow_html=True,
 )
 
@@ -214,6 +229,7 @@ if action.get("funding_note"):  _notes.append(("💰", action["funding_note"], "
 if action.get("btc_note"):      _notes.append(("₿",  action["btc_note"],     "info"))
 if action.get("session_note"):  _notes.append(("⏰", action["session_note"],  "error"))
 if action.get("asia_note"):     _notes.append(("🌏", action["asia_note"],    "info"))
+if action.get("weekend_note"):  _notes.append(("🏖️", action["weekend_note"], "warning"))
 for icon, note, kind in _notes:
     getattr(st, kind)(f"{icon} {note}")
 
@@ -288,7 +304,7 @@ with tab_signal:
         fig = make_subplots(
             rows=3, cols=1, shared_xaxes=True,
             row_heights=[0.5, 0.3, 0.2], vertical_spacing=0.03,
-            subplot_titles=["FARTCOIN Price", "Composite Signal", "Volume"],
+            subplot_titles=[f"{_disp_name} Price", "Composite Signal", "Volume"],
         )
 
         fig.add_trace(go.Scatter(
@@ -342,25 +358,162 @@ with tab_proj:
         unsafe_allow_html=True,
     )
 
+    # ── Trade Setups Panel ────────────────────────────────────────────────────
+    trade_setups = proj.get("trade_setups", [])
+    active_setups   = [s for s in trade_setups if s.get("active") and s["id"] != "NO_TRADE"]
+    inactive_setups = [s for s in trade_setups if not s.get("active") and s["id"] != "NO_TRADE"]
+
+    st.markdown("#### 🎯 Trade Setups")
+    if not active_setups:
+        st.markdown(
+            '<div style="background:#263238;border-left:4px solid #546e7a;border-radius:6px;'
+            'padding:12px 16px;font-size:0.9rem;color:#90a4ae">'
+            '🚫 <b>NO ACTIVE SETUPS</b> — Model below 55% threshold. '
+            'No edge after Bybit carry costs. Wait for a setup to activate.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        _setup_dir_colors = {"short": "#b71c1c", "long": "#1b5e20", "flat": "#37474f"}
+        _setup_dir_icons  = {"short": "⬇️ SHORT", "long": "⬆️ LONG", "flat": "⏸️ FLAT"}
+
+        ts_cols = st.columns(min(len(active_setups), 3))
+        for i, setup in enumerate(active_setups[:3]):
+            col = ts_cols[i % len(ts_cols)]
+            sd   = setup.get("direction", "flat")
+            sc   = _setup_dir_colors.get(sd, "#37474f")
+            si   = _setup_dir_icons.get(sd, sd.upper())
+            conf = setup.get("confidence", 0)
+            conf_bar = int(conf * 100)
+            conf_color = "#1b5e20" if conf >= 0.70 else "#e65100" if conf >= 0.50 else "#546e7a"
+
+            col.markdown(
+                f'<div class="proj-card" style="border-color:{sc};background:{sc}22">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<b style="color:{sc};font-size:1rem">{si}</b>'
+                f'<span style="background:{conf_color};color:#fff;border-radius:4px;'
+                f'padding:2px 8px;font-size:0.75rem;font-weight:700">{conf:.0%} conf</span>'
+                f'</div>'
+                f'<div style="font-size:0.78rem;color:#aaa;margin:2px 0 6px">'
+                f'<b>{setup["id"].replace("_", " ")}</b>'
+                f'</div>'
+                f'<div style="font-size:0.85rem;margin-bottom:8px">'
+                f'{setup.get("trigger","")}'
+                f'</div>'
+                f'<div style="font-size:0.78rem;color:#aaa">'
+                f'Target: <b style="color:#fff">{setup.get("target_pct",0):+.2f}%</b>'
+                f'&nbsp;|&nbsp; {setup.get("stop_note","")}</div>'
+                f'<div style="font-size:0.72rem;color:#607d8b;margin-top:4px">'
+                f'📊 {setup.get("historical_edge","")}</div>'
+                f'<div style="font-size:0.72rem;color:#546e7a;margin-top:2px">'
+                f'🕐 {setup.get("time_window","")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Pending setups (inactive — waiting for trigger)
+    if inactive_setups:
+        with st.expander(f"⏳ {len(inactive_setups)} pending setup(s) — waiting for trigger"):
+            for setup in inactive_setups:
+                sd = setup.get("direction", "flat")
+                sc = _setup_dir_colors.get(sd, "#37474f") if active_setups else "#37474f"
+                st.markdown(
+                    f'**{setup["id"].replace("_"," ")}** ({sd.upper()}) — '
+                    f'{setup.get("trigger","")} · '
+                    f'*{setup.get("time_window","")}*'
+                )
+
+    st.markdown("---")
+
     # ── Row 1: Probability + Manipulation cycle ───────────────────────────────
     r1a, r1b = st.columns([3, 2])
 
-    prob_data = proj.get("probability", {})
-    prob_val  = prob_data.get("prob_positive_4h", 0.5)
-    exp_move  = prob_data.get("expected_move_pct", 0)
-    prob_conv = prob_data.get("conviction", "LOW")
+    prob_data       = proj.get("probability", {})
+    prob_val        = prob_data.get("prob_positive_4h", 0.5)
+    exp_move        = prob_data.get("expected_move_pct", 0)
+    prob_conv       = prob_data.get("conviction", "LOW")
+    entry_rec       = prob_data.get("entry_recommendation", "")
+    above_threshold = prob_data.get("above_bybit_threshold", False)
+    bybit_entry_thr = prob_data.get("bybit_entry_threshold", 0.55)
+    bybit_be        = prob_data.get("bybit_break_even", 0.61)
+    bybit_carry     = prob_data.get("bybit_carry_4h_pct", 0.45)
 
     with r1a:
-        st.markdown("#### Probability Model")
-        pcolor = "#1b5e20" if prob_val > 0.6 else "#b71c1c" if prob_val < 0.4 else "#1565c0"
+        st.markdown("#### Probability Model (Bybit-calibrated)")
+
+        # Color: green above break-even, amber in entry zone, red below entry, grey neutral
+        if prob_val >= bybit_be:
+            pcolor = "#1b5e20"    # strong green
+        elif prob_val >= bybit_entry_thr:
+            pcolor = "#e65100"    # amber — above entry threshold but below break-even
+        elif prob_val <= (1 - bybit_be):
+            pcolor = "#b71c1c"    # strong red
+        elif prob_val <= (1 - bybit_entry_thr):
+            pcolor = "#880e4f"    # dark pink bearish
+        else:
+            pcolor = "#37474f"    # grey — no edge zone
+
+        # Entry/no-trade banner
+        if above_threshold:
+            entry_banner = (
+                '<div style="background:#1b5e20;color:#fff;border-radius:4px;padding:3px 10px;'
+                'font-weight:800;font-size:0.82rem;margin-bottom:6px;display:inline-block">'
+                f'✅ ENTRY SIGNAL — prob {prob_val:.0%} ≥ {bybit_entry_thr:.0%} threshold</div><br>'
+            )
+        elif prob_val <= (1 - bybit_entry_thr):
+            entry_banner = (
+                '<div style="background:#880e4f;color:#fff;border-radius:4px;padding:3px 10px;'
+                'font-weight:800;font-size:0.82rem;margin-bottom:6px;display:inline-block">'
+                f'⚠️ BEARISH — prob {prob_val:.0%} ≤ {1-bybit_entry_thr:.0%}</div><br>'
+            )
+        else:
+            entry_banner = (
+                '<div style="background:#37474f;color:#ccc;border-radius:4px;padding:3px 10px;'
+                'font-weight:700;font-size:0.82rem;margin-bottom:6px;display:inline-block">'
+                f'🚫 NO TRADE — {prob_val:.0%} is between {1-bybit_entry_thr:.0%}–{bybit_entry_thr:.0%} (no edge after carry)</div><br>'
+            )
+
+        # Threshold gauge bar (simple inline HTML)
+        bar_pct = int(prob_val * 100)
+        be_pct  = int(bybit_be * 100)
+        ent_pct = int(bybit_entry_thr * 100)
+        gauge_bar = (
+            f'<div style="position:relative;height:8px;background:#333;border-radius:4px;margin:6px 0 10px">'
+            f'<div style="position:absolute;left:0;width:{bar_pct}%;height:100%;background:{pcolor};border-radius:4px"></div>'
+            f'<div style="position:absolute;left:{ent_pct}%;top:-3px;width:2px;height:14px;background:#ff9800" title="Entry threshold {bybit_entry_thr:.0%}"></div>'
+            f'<div style="position:absolute;left:{be_pct}%;top:-3px;width:2px;height:14px;background:#4caf50" title="Break-even {bybit_be:.0%}"></div>'
+            f'</div>'
+            f'<div style="font-size:0.7rem;color:#888;display:flex;justify-content:space-between">'
+            f'<span>0%</span>'
+            f'<span style="color:#ff9800">▲ Entry {bybit_entry_thr:.0%}</span>'
+            f'<span style="color:#4caf50">▲ B/E {bybit_be:.0%}</span>'
+            f'<span>100%</span>'
+            f'</div>'
+        )
+
+        # BTC divergence badge
+        btc_div_badge = ""
+        if prob_data.get("btc_divergence"):
+            btc_div_badge = (
+                '<div style="background:#e65100;color:#fff;border-radius:4px;padding:3px 10px;'
+                'font-weight:700;font-size:0.78rem;margin-bottom:6px;display:inline-block">'
+                '⚠ BTC DIVERGENCE — FART lagging BTC rally (bearish confirmation)</div><br>'
+            )
+
         st.markdown(
             f'<div class="proj-card" style="border-color:{pcolor};background:{pcolor}22">'
+            f'{entry_banner}'
+            f'{btc_div_badge}'
             f'<span style="font-size:2rem;font-weight:800;color:{pcolor}">{prob_val:.0%}</span>'
             f'&nbsp;&nbsp;probability of positive 4h return<br>'
             f'<b>Expected move:</b> {exp_move:+.2f}% &nbsp;|&nbsp; '
             f'<b>Conviction:</b> {prob_conv} &nbsp;|&nbsp; '
             f'<b>n=</b>{prob_data.get("model_n_train", 0):,}<br>'
-            f'<span style="font-size:0.8rem;color:#aaa">{prob_data.get("description","")}</span>'
+            f'{gauge_bar}'
+            f'<span style="font-size:0.75rem;color:#888">'
+            f'Bybit carry cost: <b>{bybit_carry:.2f}%/4h</b> &nbsp;|&nbsp; '
+            f'Entry threshold: <b>{bybit_entry_thr:.0%}</b> &nbsp;|&nbsp; '
+            f'Break-even: <b>{bybit_be:.0%}</b>'
+            f'</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -375,12 +528,25 @@ with tab_proj:
             "QUIET_ACCUMULATION":"#1565c0",
             "DORMANT":           "#37474f",
         }
-        ccolor = _ccolors.get(phase, "#37474f")
-        est    = cycle.get("est_hours_to_move")
-        est_txt = f"Est. move: ~{est}h" if est is not None else ""
+        _phase_icons = {
+            "SPIKE_IN_PROGRESS": "🚨 EXIT",
+            "BUILDUP":           "⚡ BUILDUP",
+            "QUIET_ACCUMULATION":"🔍 QUIET ACCUM",
+            "DORMANT":           "😴 DORMANT",
+        }
+        ccolor   = _ccolors.get(phase, "#37474f")
+        phase_lbl = _phase_icons.get(phase, phase)
+        est      = cycle.get("est_hours_to_move")
+        est_txt  = f"Est. move: ~{est}h" if est is not None and phase != "SPIKE_IN_PROGRESS" else ""
+        exit_banner = (
+            '<div style="background:#b71c1c;color:#fff;border-radius:4px;padding:4px 10px;'
+            'font-weight:800;font-size:0.85rem;margin-bottom:6px">⛔ DO NOT ENTER — CLOSE POSITIONS</div>'
+            if phase == "SPIKE_IN_PROGRESS" else ""
+        )
         st.markdown(
             f'<div class="proj-card" style="border-color:{ccolor};background:{ccolor}22">'
-            f'<span style="font-size:1.2rem;font-weight:800;color:{ccolor}">{phase}</span> '
+            f'{exit_banner}'
+            f'<span style="font-size:1.2rem;font-weight:800;color:{ccolor}">{phase_lbl}</span> '
             f'({cycle.get("confidence", 0):.0%} conf)<br>'
             f'{est_txt}<br>'
             f'<span style="font-size:0.8rem;color:#aaa">{cycle.get("description","")}</span>'
@@ -427,15 +593,23 @@ with tab_proj:
         fig_fan.add_trace(go.Scatter(x=hours_fwd, y=centers, mode="lines+markers",
                                      name="Expected", line=dict(color="#ffeb3b", dash="dash", width=2)))
         fig_fan.add_vline(x=0, line_color="#546e7a", line_dash="dash")
+        thin_vol = h4.get("thin_volume", False)
+        vol_ratio_val = h4.get("volume_ratio", 1.0)
+        vol_note = (
+            f" ⚠ THIN VOLUME ({vol_ratio_val:.0%} of 24h avg) — bands widened, expect wider spreads"
+            if thin_vol else ""
+        )
         fig_fan.update_layout(
             title=f"4h: ${h4['low_68']:.4f} – ${h4['high_68']:.4f} (68%) | "
-                  f"${h4['low_95']:.4f} – ${h4['high_95']:.4f} (95%)",
+                  f"${h4['low_95']:.4f} – ${h4['high_95']:.4f} (95%){vol_note}",
             xaxis_title="Hours (0 = now)", yaxis_title="Price ($)",
             template="plotly_dark", height=320,
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
             margin=dict(t=40, b=10),
         )
         st.plotly_chart(fig_fan, use_container_width=True)
+        if thin_vol:
+            st.warning(f"⚠ Volume at {vol_ratio_val:.0%} of 24h avg — reduce position size 25-30%, expect wide spreads")
 
     st.markdown("---")
 
@@ -469,19 +643,47 @@ with tab_proj:
         if lsr_data and lsr_data.get("projected_path"):
             path = lsr_data["projected_path"]
             pct  = lsr_data.get("percentile", 0.5)
-            bar_color = "#e57373" if pct < 0.3 else "#66bb6a" if pct > 0.7 else "#90caf9"
+            # Calibrated: p85+ = extreme (forced unwind), p75+ = high crowding
+            if pct >= 0.85:
+                bar_color = "#b71c1c"
+            elif pct >= 0.75:
+                bar_color = "#e65100"
+            elif pct <= 0.15:
+                bar_color = "#1565c0"
+            elif pct <= 0.25:
+                bar_color = "#1976d2"
+            else:
+                bar_color = "#90caf9"
+
             fig_lsr = go.Figure()
             fig_lsr.add_trace(go.Scatter(
                 x=list(range(1, len(path)+1)), y=path, mode="lines",
                 name="Projected", line=dict(color=bar_color, dash="dash", width=2)))
             fig_lsr.add_hline(y=lsr_data.get("median", 1.0), line_dash="dot",
                               annotation_text="Median", line_color="#546e7a")
+            # Add extremity threshold lines
+            fig_lsr.add_hline(y=float(lsr_data.get("current", 1.0)),
+                              line_color=bar_color, line_dash="dot", line_width=1,
+                              annotation_text=f"Now {lsr_data['current']:.3f}")
             fig_lsr.update_layout(
-                title=f"Long/Short Ratio  (now {lsr_data['current']:.3f}, {pct:.0%}ile)",
+                title=f"Long/Short Ratio  (now {lsr_data['current']:.3f}, {pct:.0%}ile) — "
+                      f"reversion in ~{lsr_data.get('avg_revert_time_h',8):.0f}h ({lsr_data.get('revert_rate',0):.0%} rate)",
                 xaxis_title="Hours", yaxis_title="LSR",
                 template="plotly_dark", height=260, margin=dict(t=36, b=10),
             )
             st.plotly_chart(fig_lsr, use_container_width=True)
+
+            # Extremity action alert
+            lsr_action = lsr_data.get("lsr_action", "")
+            if pct >= 0.85:
+                st.error(f"🔴 FORCED UNWIND SIGNAL — {lsr_action}")
+            elif pct >= 0.75:
+                st.warning(f"⚠ {lsr_action}")
+            elif pct <= 0.15:
+                st.error(f"🔵 SHORT SQUEEZE RISK — {lsr_action}")
+            elif pct <= 0.25:
+                st.warning(f"⚠ {lsr_action}")
+
             st.caption(lsr_data.get("description", ""))
         else:
             st.info("No LSR reversion data")
@@ -500,8 +702,29 @@ with tab_proj:
     with ctx_c1:
         st.markdown("**BTC Lead-Lag**")
         ll_color = "#b71c1c" if abs(btc_2h) > 2 else "#e65100" if abs(btc_2h) > 1 else "#1565c0"
+
+        # Badge logic — divergence takes priority over standard override
+        btc_ov_type = prob_data.get("btc_override_type", "")
+        btc_is_div  = prob_data.get("btc_divergence", False)
+        btc_ov_badge = ""
+        if btc_is_div:
+            btc_ov_badge = (
+                '<div style="background:#e65100;color:#fff;border-radius:4px;padding:3px 10px;'
+                'font-size:0.78rem;font-weight:800;margin-bottom:6px">'
+                '⚠ BTC DIVERGENCE — FART lagging BTC rally. '
+                'If FART doesn\'t follow within 1-2h → SHORT the divergence.</div>'
+            )
+        elif btc_ov_type == "BTC_DUMP_LOW_FUND_BUY":
+            btc_ov_badge = '<div style="background:#1b5e20;color:#fff;border-radius:4px;padding:3px 10px;font-size:0.78rem;font-weight:800;margin-bottom:6px">⭐ HIGH-CONVICTION LONG — BTC dump + low funding override active</div>'
+        elif btc_ov_type == "BTC_RALLY_HIGH_FUND_FADE":
+            btc_ov_badge = '<div style="background:#b71c1c;color:#fff;border-radius:4px;padding:3px 10px;font-size:0.78rem;font-weight:800;margin-bottom:6px">⚠ DON\'T CHASE — BTC rally + high funding, 24% hist win rate</div>'
+        elif btc_ov_type == "BTC_DIRECTION":
+            btc_ov_badge = '<div style="background:#e65100;color:#fff;border-radius:4px;padding:3px 10px;font-size:0.78rem;font-weight:800;margin-bottom:6px">⚡ BTC DIRECTION OVERRIDE active</div>'
+
+        if btc_ov_badge:
+            st.markdown(btc_ov_badge, unsafe_allow_html=True)
         _proj_card(
-            f"BTC +{btc_2h:+.1f}% → FART {proj_fart:+.1f}% projected",
+            f"BTC {btc_2h:+.1f}% → FART {proj_fart:+.1f}% projected",
             btc_ll.get("description", "No data"),
             color=ll_color, icon="₿",
         )
@@ -510,26 +733,62 @@ with tab_proj:
         bc2.metric("FART proj", f"{proj_fart:+.1f}%")
         bc3.metric("Confidence", f"{btc_conf:.0%}")
 
-    sess_cond = proj.get("session_conditional", {})
-    edge      = sess_cond.get("combined_edge_pct", 0)
-    quality   = sess_cond.get("quality", "")
+    sess_cond    = proj.get("session_conditional", {})
+    edge         = sess_cond.get("combined_edge_pct", 0)
+    quality      = sess_cond.get("quality", "")
+    dow_name     = sess_cond.get("day_of_week", "")
+    dow_bias     = sess_cond.get("day_bias", "neutral")
+    vol_pct_avg  = sess_cond.get("volume_pct_of_avg", 1.0)
+    thin_vol_ses = vol_pct_avg < 0.70
+
     with ctx_c2:
         st.markdown("**Session-Conditional Edge**")
         se_color = "#1b5e20" if edge > 0.5 else "#b71c1c" if edge < -0.5 else "#e65100"
+
+        # Volume status pill
+        if vol_pct_avg < 0.50:
+            vol_pill = f'<span style="background:#b71c1c;color:#fff;border-radius:3px;padding:1px 7px;font-size:0.72rem;font-weight:700">VERY THIN VOL {vol_pct_avg:.0%}</span>'
+        elif vol_pct_avg < 0.70:
+            vol_pill = f'<span style="background:#e65100;color:#fff;border-radius:3px;padding:1px 7px;font-size:0.72rem;font-weight:700">THIN VOL {vol_pct_avg:.0%}</span>'
+        else:
+            vol_pill = f'<span style="background:#37474f;color:#ccc;border-radius:3px;padding:1px 7px;font-size:0.72rem">Vol {vol_pct_avg:.0%} of avg</span>'
+
         _proj_card(
             f"Edge: {edge:+.2f}%  [{quality}]",
             sess_cond.get("description", "No data"),
             color=se_color, icon="⏰",
         )
-        sc1, sc2 = st.columns(2)
+        st.markdown(vol_pill, unsafe_allow_html=True)
+
+        if thin_vol_ses:
+            size_cut = "40%+" if vol_pct_avg < 0.50 else "25-30%"
+            st.warning(f"⚠ Thin volume ({vol_pct_avg:.0%} of 24h avg) — reduce position size {size_cut}")
+
+        # Day-of-week bias badge
+        if dow_bias == "bearish":
+            st.markdown(
+                f'<span style="background:#b71c1c22;border:1px solid #b71c1c;color:#ef9a9a;'
+                f'border-radius:4px;padding:3px 10px;font-size:0.8rem">'
+                f'⚠ {dow_name} — historical bearish bias</span>',
+                unsafe_allow_html=True,
+            )
+        elif dow_bias == "bullish":
+            st.markdown(
+                f'<span style="background:#1b5e2022;border:1px solid #1b5e20;color:#a5d6a7;'
+                f'border-radius:4px;padding:3px 10px;font-size:0.8rem">'
+                f'✅ {dow_name} — historical bullish bias</span>',
+                unsafe_allow_html=True,
+            )
+        sc1, sc2, sc3 = st.columns(3)
         sc1.metric("Combined Edge", f"{edge:+.2f}%")
         sc2.metric("Samples", f"n={sess_cond.get('n_samples',0)}")
+        sc3.metric("Volume", f"{vol_pct_avg:.0%} of avg")
 
     st.markdown("---")
 
     # ── Row 5: External data projections ─────────────────────────────────────
     st.markdown("#### External Data Signals")
-    ext_c1, ext_c2, ext_c3 = st.columns(3)
+    ext_c1, ext_c2, ext_c3, ext_c4 = st.columns(4)
 
     # — News / Sentiment ——————————————————————————————————————————————————
     news = proj.get("news_sentiment", {})
@@ -603,6 +862,223 @@ with tab_proj:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+
+    # — Coinglass OI Momentum + Funding Spread (Bybit-aware) ———————————————
+    cg = proj.get("coinglass_oi_funding", {})
+    with ext_c4:
+        st.markdown("**OI / Funding (Bybit-calibrated)**")
+        if not cg.get("available"):
+            st.info("No Coinglass data — run: python3 external_collectors.py --source coinglass")
+        else:
+            cga          = cg.get("assessment", "NORMAL")
+            bybit_rate   = cg.get("bybit_rate", 0)
+            binance_rate = cg.get("binance_rate", 0)
+            daily_carry  = cg.get("bybit_daily_carry_pct", bybit_rate * 3)
+            bb_div       = cg.get("binance_bybit_divergence", "NORMAL")
+
+            # Colour map — includes new Bybit-specific assessments
+            _cg_colors = {
+                "OI_PRICE_DIV_LONG":        "#1b5e20",
+                "PASSIVE_ACCUM":            "#2e7d32",
+                "EXTREME_SHORT_FUNDING":    "#1565c0",
+                "BINANCE_BEARISH_VS_BYBIT": "#b71c1c",
+                "BOTH_CROWDED_LONG":        "#c62828",
+                "OI_BUILDING_PRICE_WEAK":   "#b71c1c",   # NEW: longs trapped
+                "OI_SPIKE_CAUTION":         "#b71c1c",
+                "OI_SURGE_CAUTION":         "#c62828",
+                "OI_TREND_CHASE_BEARISH":   "#e65100",
+                "EXTREME_LONG":             "#c62828",
+                "HIGH_LONG":                "#e65100",
+                "SETTLEMENT_IMMINENT":      "#f57f17",
+                "OI_BUILDING":              "#546e7a",
+                "FUNDING_SPREAD":           "#546e7a",
+                "NORMAL":                   "#37474f",
+            }
+            cg_color = _cg_colors.get(cga, "#37474f")
+            cg_icon = (
+                "⭐" if cga in ("OI_PRICE_DIV_LONG", "PASSIVE_ACCUM", "EXTREME_SHORT_FUNDING")
+                else "🔴" if cga == "OI_BUILDING_PRICE_WEAK"
+                else "⚠" if cga in ("OI_SPIKE_CAUTION", "OI_TREND_CHASE_BEARISH",
+                                    "EXTREME_LONG", "HIGH_LONG", "BINANCE_BEARISH_VS_BYBIT",
+                                    "BOTH_CROWDED_LONG")
+                else "⚡" if cga == "SETTLEMENT_IMMINENT" else ""
+            )
+
+            m5      = cg.get("m5_oi_chg", 0)
+            m15     = cg.get("m15_oi_chg", 0)
+            h1      = cg.get("h1_oi_chg", 0)
+            oi_div  = cg.get("oi_price_divergence", "NORMAL")
+            spread  = cg.get("spread_pct", 0)
+            settle  = cg.get("mins_to_settle", 999)
+            settle_str = f"⚡ {settle:.0f}min to settle" if cg.get("settlement_imminent") else ""
+
+            # Carry cost pill colour: red if >1%/day, orange if >0.5%
+            carry_color = "#b71c1c" if daily_carry > 1.0 else "#e65100" if daily_carry > 0.5 else "#37474f"
+
+            # Divergence badge
+            div_badge = ""
+            if bb_div == "BINANCE_BEARISH_VS_BYBIT":
+                div_badge = (
+                    '<span style="background:#b71c1c;color:#fff;border-radius:3px;'
+                    'padding:1px 6px;font-size:0.72rem;font-weight:700">'
+                    '⚠ BINANCE BEARISH vs BYBIT</span><br>'
+                )
+            elif bb_div == "BOTH_CROWDED_LONG":
+                div_badge = (
+                    '<span style="background:#c62828;color:#fff;border-radius:3px;'
+                    'padding:1px 6px;font-size:0.72rem;font-weight:700">'
+                    '⚠ BOTH EXCHANGES CROWDED LONG</span><br>'
+                )
+
+            st.markdown(
+                f'<div class="proj-card" style="border-color:{cg_color};background:{cg_color}18">'
+                f'<b style="color:{cg_color}">{cg_icon} {cga}</b><br>'
+                f'{div_badge}'
+                f'OI: 5m <b>{m5:+.1f}%</b> · 15m <b>{m15:+.1f}%</b> · 1h <b>{h1:+.1f}%</b><br>'
+                f'Divergence: <b>{oi_div}</b><br>'
+                f'Bybit: <b style="color:{carry_color}">{bybit_rate:+.3f}%/8h</b> '
+                f'· carry: <b style="color:{carry_color}">{daily_carry:+.2f}%/day</b><br>'
+                f'Binance: <b>{binance_rate:+.3f}%</b> · Spread: <b>{spread:.3f}%</b><br>'
+                f'{"<b>" + settle_str + "</b><br>" if settle_str else ""}'
+                f'<span style="font-size:0.78rem;color:#aaa">{cg.get("description","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            # Contextual callouts
+            if cga == "OI_PRICE_DIV_LONG":
+                st.success("⭐ SPOT DIP: historically +0.96% avg 4h, 70% hit rate")
+            elif cga == "OI_BUILDING_PRICE_WEAK":
+                st.error("🔴 LONGS TRAPPED: OI building while price falls — exhaustion fingerprint (-0.25% avg 4h, 44% hit)")
+            elif cga == "BINANCE_BEARISH_VS_BYBIT":
+                st.warning("⚠ Informed money (Binance) is bearish while Bybit longs pay floor rate")
+            elif daily_carry >= 1.5:
+                st.error(f"🔴 Bybit carry {daily_carry:+.2f}%/day — longs need strong conviction to overcome cost")
+
+    st.markdown("---")
+
+    # ── Row 6: Settlement Cycle + Liquidation Cascade ────────────────────────
+    st.markdown("#### Structural Pattern Models")
+    struct_c1, struct_c2 = st.columns(2)
+
+    # — Settlement Cycle ——————————————————————————————————————————————————
+    settlement = proj.get("funding_settlement", {})
+    with struct_c1:
+        st.markdown("**Funding Settlement Cycle**")
+        s_phase        = settlement.get("phase", "MID_CYCLE")
+        s_mins         = settlement.get("mins_to_settlement", 999)
+        s_effect       = settlement.get("expected_effect", "UNKNOWN")
+        s_conf         = settlement.get("confidence", 0)
+        s_funding_sign = settlement.get("current_funding_sign", "NEUTRAL")
+        s_pre          = settlement.get("pre_ret_mean")
+        s_post         = settlement.get("post_ret_mean")
+        s_n            = settlement.get("historical_n", 0)
+        s_dubai_time   = settlement.get("dubai_settlement_time", "")
+        s_trade_setup  = settlement.get("trade_setup")
+        s_setup_desc   = settlement.get("trade_setup_desc", "")
+
+        # Color based on phase and expected effect
+        if s_phase == "PRE_SETTLEMENT":
+            s_color = "#b71c1c" if "DOWN" in s_effect else "#1b5e20" if "UP" in s_effect else "#e65100"
+        elif s_phase == "JUST_SETTLED":
+            s_color = "#1b5e20" if "UP" in s_effect else "#b71c1c" if "DOWN" in s_effect else "#1565c0"
+        elif s_trade_setup and "FADE" in s_trade_setup:
+            s_color = "#e65100"   # upcoming short setup
+        else:
+            s_color = "#37474f"
+
+        _phase_labels = {
+            "PRE_SETTLEMENT": "⚡ PRE-SETTLEMENT",
+            "JUST_SETTLED":   "✅ JUST SETTLED",
+            "MID_CYCLE":      "🔄 MID-CYCLE",
+        }
+        s_label     = _phase_labels.get(s_phase, s_phase)
+        next_settle = settlement.get("next_settlement_utc", "?")
+        dubai_str   = f" · {s_dubai_time}" if s_dubai_time else ""
+
+        pre_str  = f"Pre avg: {s_pre:+.2f}%" if s_pre is not None else "Pre: n/a"
+        post_str = f"Post avg: {s_post:+.2f}%" if s_post is not None else "Post: n/a"
+
+        # Trade setup callout block
+        setup_html = ""
+        if s_setup_desc:
+            setup_color = "#b71c1c" if "FADE" in (s_trade_setup or "") else "#1b5e20" if "LONG" in (s_trade_setup or "") else "#e65100"
+            setup_html = (
+                f'<div style="background:{setup_color}22;border-left:3px solid {setup_color};'
+                f'border-radius:4px;padding:6px 10px;margin-top:8px;font-size:0.82rem">'
+                f'<b>🎯 {(s_trade_setup or "").replace("_"," ")}</b><br>'
+                f'{s_setup_desc}'
+                f'</div>'
+            )
+
+        st.markdown(
+            f'<div class="proj-card" style="border-color:{s_color};background:{s_color}18">'
+            f'<b style="color:{s_color};font-size:1.1rem">{s_label}</b><br>'
+            f'Next settlement: <b>{next_settle}{dubai_str}</b> ({s_mins:.0f}min away)<br>'
+            f'Funding: <b>{s_funding_sign}</b> &nbsp;|&nbsp; '
+            f'Expected: <b>{s_effect}</b><br>'
+            f'{pre_str} &nbsp;|&nbsp; {post_str} &nbsp;|&nbsp; n={s_n}<br>'
+            f'Confidence: <b>{s_conf:.0%}</b><br>'
+            f'{setup_html}'
+            f'<span style="font-size:0.78rem;color:#aaa;margin-top:6px;display:block">'
+            f'{settlement.get("description","")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Phase", s_phase.replace("_", " "))
+        sc2.metric("Next Settle", f"{next_settle}{dubai_str}")
+        sc3.metric("Confidence", f"{s_conf:.0%}")
+
+    # — Liquidation Cascade ——————————————————————————————————————————————
+    liq_cas = proj.get("liq_cascade", {})
+    with struct_c2:
+        st.markdown("**Liquidation Cascade Detector**")
+        lc_state    = liq_cas.get("state", "NORMAL")
+        lc_detected = liq_cas.get("cascade_detected", False)
+        lc_z        = liq_cas.get("liq_zscore", 0)
+        lc_candles  = liq_cas.get("candles_since_cascade")
+        lc_wick     = liq_cas.get("wick_ratio", 0)
+        lc_vol_r    = liq_cas.get("volume_ratio", 0)
+        lc_4h_avg   = liq_cas.get("post_cascade_avg_4h", 0)
+        lc_hit      = liq_cas.get("post_cascade_hit_rate", 0)
+        lc_n        = liq_cas.get("historical_n", 0)
+        lc_conf     = liq_cas.get("confidence", 0)
+
+        _lc_colors = {
+            "CASCADE_IN_PROGRESS": "#b71c1c",
+            "POST_CASCADE_ENTRY":  "#1b5e20",
+            "POST_CASCADE_WATCH":  "#e65100",
+            "NORMAL":              "#37474f",
+        }
+        _lc_icons = {
+            "CASCADE_IN_PROGRESS": "⚡ CASCADE IN PROGRESS",
+            "POST_CASCADE_ENTRY":  "✅ POST-CASCADE ENTRY",
+            "POST_CASCADE_WATCH":  "👀 POST-CASCADE WATCH",
+            "NORMAL":              "😴 NO CASCADE",
+        }
+        lc_color = _lc_colors.get(lc_state, "#37474f")
+        lc_label = _lc_icons.get(lc_state, lc_state)
+
+        candle_str = f"Candles since: <b>{lc_candles}</b><br>" if lc_candles is not None else ""
+        hist_str   = f"Historical: <b>{lc_4h_avg:+.1f}%</b> avg 4h, <b>{lc_hit:.0%}</b> hit (n={lc_n})" if lc_n >= 5 else ""
+
+        st.markdown(
+            f'<div class="proj-card" style="border-color:{lc_color};background:{lc_color}18">'
+            f'<b style="color:{lc_color};font-size:1.1rem">{lc_label}</b><br>'
+            f'Liq z-score: <b>{lc_z:.1f}σ</b> &nbsp;|&nbsp; '
+            f'Wick ratio: <b>{lc_wick:.1f}x</b> &nbsp;|&nbsp; '
+            f'Vol spike: <b>{lc_vol_r:.1f}x</b><br>'
+            f'{candle_str}'
+            f'{hist_str + "<br>" if hist_str else ""}'
+            f'Confidence: <b>{lc_conf:.0%}</b><br>'
+            f'<span style="font-size:0.8rem;color:#aaa">{liq_cas.get("description","")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        lc1, lc2, lc3 = st.columns(3)
+        lc1.metric("State", lc_state.replace("_", " "))
+        lc2.metric("Liq z-score", f"{lc_z:.1f}σ")
+        lc3.metric("4h Post-Cas avg", f"{lc_4h_avg:+.1f}%" if lc_n >= 5 else "N/A")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -725,20 +1201,247 @@ with tab_timing:
             )
             st.plotly_chart(fig_day, use_container_width=True)
 
-        # Timing playbook table
+        # Weekend Insight
+        if mkt.get("is_weekend"):
+            st.markdown("---")
+            st.markdown("#### 📉 Weekend Market Dynamics")
+            w1, w2 = st.columns(2)
+            with w1:
+                st.info("Weekend liquidity is 30-50% lower than weekday averages. This amplifies every order, making manipulation (spoof-walls, stop-hunts) much cheaper for Market Makers.")
+            with w2:
+                st.warning("Historically, Sunday (22:00 UTC) marks the 'Sunday Dump' as TradFi markets prepare for Monday open. Exit weekend longs before this window.")
+
+        # ── Kill Zones Deep Dive ─────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("## 🎯 Kill Zones — Market Maker Stop Hunt Analysis")
+        st.caption(
+            "Kill zones are recurring hours where market makers consistently hunt stops. "
+            "Identified from 90 days / 2,128 hourly observations. "
+            "Avoid entering positions 30 min before these windows."
+        )
+
+        # Per-hour stats computed from OHLCV
+        df_h = df.copy()
+        df_h["dow"] = df_h.index.dayofweek
+        df_h["fwd_4h"] = df_h[price_col].pct_change(4).shift(-4) * 100
+        df_h = df_h.dropna(subset=["return", "fwd_4h"])
+
+        hourly_stats = {}
+        for h in range(24):
+            sub = df_h[df_h["hour"] == h]
+            hourly_stats[h] = {
+                "n": len(sub),
+                "mean_1h": sub["return"].mean() * 100,
+                "hit_1h": (sub["return"] > 0).mean(),
+                "mean_4h": sub["fwd_4h"].mean(),
+                "hit_4h": (sub["fwd_4h"] > 0).mean(),
+            }
+
+        # Classify each hour
+        KILL_HOURS   = {0, 1, 3, 7, 11, 18}   # from bias table + data confirmation
+        STRONG_HOURS = {10, 19, 20, 22}
+
+        kz_now = now_h in KILL_HOURS
+        st_now = now_h in STRONG_HOURS
+
+        # Current hour status banner
+        hrs_until_kill   = min((h - now_h) % 24 for h in KILL_HOURS)
+        hrs_until_strong = min((h - now_h) % 24 for h in STRONG_HOURS)
+        next_kill_h   = (now_h + hrs_until_kill) % 24
+        next_strong_h = (now_h + hrs_until_strong) % 24
+
+        kz_c1, kz_c2, kz_c3 = st.columns(3)
+        with kz_c1:
+            if kz_now:
+                st.error(f"🚨 IN KILL ZONE NOW ({now_h:02d}:00 UTC) — AVOID NEW ENTRIES")
+            else:
+                st.markdown(
+                    f'<div style="background:#1e272e;border-left:4px solid #e57373;'
+                    f'padding:12px;border-radius:6px">'
+                    f'<b style="color:#e57373">Next Kill Zone</b><br>'
+                    f'<span style="font-size:1.4rem;font-weight:800">{next_kill_h:02d}:00 UTC</span><br>'
+                    f'<span style="color:#aaa">in ~{hrs_until_kill}h</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        with kz_c2:
+            if st_now:
+                st.success(f"✅ IN STRONG WINDOW NOW ({now_h:02d}:00 UTC) — FAVORABLE FOR ENTRY")
+            else:
+                st.markdown(
+                    f'<div style="background:#1e272e;border-left:4px solid #66bb6a;'
+                    f'padding:12px;border-radius:6px">'
+                    f'<b style="color:#66bb6a">Next Strong Window</b><br>'
+                    f'<span style="font-size:1.4rem;font-weight:800">{next_strong_h:02d}:00 UTC</span><br>'
+                    f'<span style="color:#aaa">in ~{hrs_until_strong}h</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        with kz_c3:
+            cur_stats = hourly_stats.get(now_h, {})
+            kz_bg = "#b71c1c22" if kz_now else "#1b5e2022" if st_now else "#263238"
+            kz_bd = "#b71c1c" if kz_now else "#66bb6a" if st_now else "#546e7a"
+            st.markdown(
+                f'<div style="background:{kz_bg};border-left:4px solid {kz_bd};'
+                f'padding:12px;border-radius:6px">'
+                f'<b>Current Hour Stats ({now_h:02d}:00 UTC)</b><br>'
+                f'1h avg: <b>{cur_stats.get("mean_1h",0):+.2f}%</b> · '
+                f'hit: <b>{cur_stats.get("hit_1h",0.5):.0%}</b><br>'
+                f'4h avg: <b>{cur_stats.get("mean_4h",0):+.2f}%</b> · '
+                f'hit: <b>{cur_stats.get("hit_4h",0.5):.0%}</b>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Kill zone detail cards
+        st.markdown("#### Confirmed Kill Zones")
+        kz_cols = st.columns(len(KILL_HOURS))
+        kz_defs = {
+            0:  {"et": "8 PM",  "note": "Asia open stop hunt. OI falling = -0.45% avg."},
+            1:  {"et": "9 PM",  "note": "Sat/Sun/Thu worst (-0.71%, -0.42%, -0.22%)."},
+            3:  {"et": "11 PM", "note": "Thu/Wed most reliable: -0.97%/-0.63%, 15% hit."},
+            7:  {"et": "3 AM",  "note": "London open fake-out. Mon/Tue/Sat/-0.35-0.70%."},
+            11: {"et": "7 AM",  "note": "Pre-NYC flush. Wed worst (-0.15%, 31% hit)."},
+            18: {"et": "2 PM",  "note": "MOST CONSISTENT. All days negative. -0.46% avg, 39% hit."},
+        }
+        for i, h in enumerate(sorted(KILL_HOURS)):
+            stats = hourly_stats[h]
+            info  = kz_defs.get(h, {})
+            is_now = (now_h == h)
+            border = "#ff1744" if is_now else "#b71c1c"
+            kz_cols[i].markdown(
+                f'<div style="background:#1a0000;border:2px solid {border};'
+                f'border-radius:8px;padding:12px;text-align:center">'
+                f'{"🚨 " if is_now else ""}'
+                f'<span style="font-size:1.3rem;font-weight:800;color:#ef9a9a">{h:02d}:00 UTC</span><br>'
+                f'<span style="color:#aaa;font-size:0.75rem">{info.get("et","")} ET</span><br>'
+                f'<span style="font-size:1.1rem;color:#e57373;font-weight:700">'
+                f'{stats["mean_1h"]:+.2f}%</span> avg<br>'
+                f'<span style="color:#ef9a9a">{stats["hit_1h"]:.0%} hit rate</span><br>'
+                f'<span style="font-size:0.72rem;color:#888">{info.get("note","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("#### Strong Windows (High-Probability Entry)")
+        sw_cols = st.columns(len(STRONG_HOURS))
+        sw_defs = {
+            10: {"et": "6 AM",  "note": "Pre-NYC build. +23.4 bps bias. Strong vs 90d data."},
+            19: {"et": "3 PM",  "note": "Post-kill bounce. Mon +0.44%, 77% hit. Best follow-through."},
+            20: {"et": "4 PM",  "note": "NYSE close flow. Wed: +1.19% avg, 69% hit."},
+            22: {"et": "6 PM",  "note": "Late NYC ramp. Fri: +0.57% avg, 75% hit."},
+        }
+        for i, h in enumerate(sorted(STRONG_HOURS)):
+            stats = hourly_stats[h]
+            info  = sw_defs.get(h, {})
+            is_now = (now_h == h)
+            border = "#00e676" if is_now else "#2e7d32"
+            sw_cols[i].markdown(
+                f'<div style="background:#001a00;border:2px solid {border};'
+                f'border-radius:8px;padding:12px;text-align:center">'
+                f'{"✅ " if is_now else ""}'
+                f'<span style="font-size:1.3rem;font-weight:800;color:#a5d6a7">{h:02d}:00 UTC</span><br>'
+                f'<span style="color:#aaa;font-size:0.75rem">{info.get("et","")} ET</span><br>'
+                f'<span style="font-size:1.1rem;color:#66bb6a;font-weight:700">'
+                f'{stats["mean_1h"]:+.2f}%</span> avg<br>'
+                f'<span style="color:#a5d6a7">{stats["hit_1h"]:.0%} hit rate</span><br>'
+                f'<span style="font-size:0.72rem;color:#888">{info.get("note","")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Hour × Day heatmap
+        st.markdown("---")
+        st.markdown("#### Hour × Day Heatmap (1h Avg Return %, 90 days)")
+        st.caption("Red = kill zone. Green = strong window. Most reliable combos labeled.")
+
+        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        heat_z = np.zeros((7, 24))
+        heat_text = [["" for _ in range(24)] for _ in range(7)]
+        for h in range(24):
+            for d in range(7):
+                sub = df_h[(df_h["hour"] == h) & (df_h["dow"] == d)]["return"] * 100
+                if len(sub) >= 4:
+                    val = sub.mean()
+                    heat_z[d, h] = val
+                    if abs(val) > 0.5:
+                        heat_text[d][h] = f"{val:+.1f}%"
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=heat_z,
+            x=list(range(24)),
+            y=dow_names,
+            text=heat_text,
+            texttemplate="%{text}",
+            colorscale=[
+                [0.0, "#b71c1c"], [0.35, "#c62828"], [0.48, "#263238"],
+                [0.52, "#263238"], [0.65, "#1b5e20"], [1.0, "#00c853"],
+            ],
+            zmid=0,
+            zmin=-1.5, zmax=1.5,
+            colorbar=dict(title="1h Ret %"),
+        ))
+        # Mark kill zones
+        for h in KILL_HOURS:
+            fig_heat.add_vline(x=h, line_color="#ef9a9a", line_width=1, line_dash="dot")
+        for h in STRONG_HOURS:
+            fig_heat.add_vline(x=h, line_color="#66bb6a", line_width=1, line_dash="dot")
+        fig_heat.add_vline(x=now_h, line_color="#ffeb3b", line_width=2,
+                           annotation_text=f"NOW", annotation_font_color="#ffeb3b")
+        fig_heat.update_layout(
+            template="plotly_dark", height=300,
+            xaxis=dict(title="Hour UTC", dtick=1),
+            margin=dict(t=10, b=10),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        # Most reliable combos table
+        with st.expander("📊 Top 10 Kill Zone Combos (Hour × Day)", expanded=False):
+            combo_data = []
+            for h in range(24):
+                for d in range(7):
+                    sub = df_h[(df_h["hour"]==h) & (df_h["dow"]==d)]["return"].dropna() * 100
+                    if len(sub) >= 8:
+                        consistency = abs((sub > 0).mean() - 0.5) * 2
+                        combo_data.append({
+                            "Hour (UTC)": f"{h:02d}:00",
+                            "ET": f"{(h-4)%24:02d}:00",
+                            "Day": dow_names[d],
+                            "n": len(sub),
+                            "Avg 1h Ret": f"{sub.mean():+.2f}%",
+                            "Hit Rate": f"{(sub>0).mean():.0%}",
+                            "Consistency": f"{consistency:.2f}",
+                            "Type": "🔴 Kill" if sub.mean() < -0.4 else ("🟢 Strong" if sub.mean() > 0.4 else "⚪ Neutral"),
+                        })
+            combo_df = pd.DataFrame(combo_data)
+            kills_df = combo_df[combo_df["Type"] == "🔴 Kill"].nlargest(10, "n")
+            st.dataframe(kills_df, use_container_width=True, hide_index=True)
+
+        with st.expander("📊 Top 10 Strong Combos (Hour × Day)", expanded=False):
+            combo_df2 = pd.DataFrame(combo_data) if combo_data else pd.DataFrame()
+            if not combo_df2.empty:
+                strong_df = combo_df2[combo_df2["Type"] == "🟢 Strong"].nlargest(10, "n")
+                st.dataframe(strong_df, use_container_width=True, hide_index=True)
+
+        # Timing playbook — updated
         st.markdown("---")
         st.markdown("#### Timing Playbook")
         st.markdown("""
-| Rule | Detail | ET Time |
-|------|--------|---------|
-| **Best entry** | 10:00 UTC (+23.4 bps avg) | 6:00 AM |
-| **2nd window** | 19:00–22:00 UTC (+15–19 bps) | 3–6 PM |
-| **Kill zone — AVOID** | 18:00 UTC (−26.5 bps avg) | 2:00 PM |
-| **Asia bleed — AVOID longs** | 00:00–07:00 UTC | 8 PM – 3 AM |
-| **Hold window** | 4–8 hours max | Signal decays after 8h |
-| **Hard exit** | Composite flips sign | Immediate |
-| **Best days** | Mon · Tue · Fri | |
-| **Worst days** | Thu · Sat · Sun | Dump days |
+| Rule | Hour (UTC) | ET Time | Data |
+|------|-----------|---------|------|
+| ⭐ **Best entry** | 10:00 UTC | 6:00 AM | +23.4 bps bias |
+| ✅ **Strong window** | 19:00–22:00 UTC | 3–6 PM | +15–19 bps avg |
+| ✅ **Best combo** | 21:00 Tue / 07:00 Wed | 5 PM Tue / 3 AM Wed | +1.60% / 85% hit |
+| 🔴 **Kill zone #1** | 18:00 UTC | 2:00 PM | −0.46% avg, 39% hit, ALL days |
+| 🔴 **Kill zone #2** | 03:00 Thu | 11 PM Wed | −0.97% avg, 15% hit |
+| 🔴 **Kill zone #3** | 23:00 Wed | 7 PM Wed | −1.22% avg, 23% hit |
+| 🔴 **Asia bleed** | 00:00–01:00 UTC | 8–9 PM | −0.12–0.29% avg |
+| ⚠️ **Thursday** | All day | — | −0.63% avg 4h, 41% hit |
+| ⚠️ **Sunday** | All day | — | −0.40% avg 4h, 44% hit |
+| 📏 **Hold window** | — | — | 4–8h max, decays after |
 """)
 
 

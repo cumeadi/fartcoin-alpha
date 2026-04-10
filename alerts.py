@@ -287,17 +287,27 @@ def evaluate_projection_alerts(projections, market_state):
             _fire(state, "proj_whale_accumulate")
 
     # --- Rule P7: Squeeze conditions (Coinalyze) ---
+    # NOTE: Bybit FARTCOIN has a fixed +0.5%/8h funding floor.
+    # SQUEEZE_BUILDING only fires when squeeze_risk == HIGH (>0.8% threshold),
+    # meaning it is genuinely elevated ABOVE the floor, not just at it.
     cx = projections.get("cross_exchange", {})
     if cx.get("available"):
         cx_assessment = cx.get("assessment", "NORMAL")
-        if cx_assessment in ("SQUEEZE_IN_PROGRESS", "SQUEEZE_BUILDING", "LIQUIDATION_CASCADE") and \
-                _is_cooled_down(state, "proj_squeeze", 3):
+        cx_squeeze    = cx.get("squeeze_risk", "LOW")
+        # Only alert on SQUEEZE_BUILDING if risk is genuinely HIGH (above Bybit floor)
+        squeeze_alert = (
+            cx_assessment in ("SQUEEZE_IN_PROGRESS", "LIQUIDATION_CASCADE")
+            or (cx_assessment == "SQUEEZE_BUILDING" and cx_squeeze == "HIGH")
+        )
+        if squeeze_alert and _is_cooled_down(state, "proj_squeeze", 3):
+            pred_fund = cx.get("predicted_funding", 0)
             msg = (
                 f"*FARTCOIN SQUEEZE / LIQUIDATION ALERT*\n\n"
                 f"*Assessment:* {cx_assessment}\n"
-                f"*Predicted Funding:* {cx.get('predicted_funding', 0):.4%}\n"
+                f"*Predicted Funding:* {pred_fund:.4%} "
+                f"{'(above Bybit floor — genuine signal)' if pred_fund > 0.008 else '(near Bybit floor)'}\n"
                 f"*Liq Z-Score:* {cx.get('liq_zscore', 0):.1f}σ\n"
-                f"*Squeeze Risk:* {cx.get('squeeze_risk', 'N/A')}\n\n"
+                f"*Squeeze Risk:* {cx_squeeze}\n\n"
                 f"{cx.get('description', '')}"
             )
             alerts.append({
@@ -307,6 +317,127 @@ def evaluate_projection_alerts(projections, market_state):
                 "message": msg,
             })
             _fire(state, "proj_squeeze")
+
+    # --- Rule P8: Coinglass OI spike or settlement imminent ---
+    cg = projections.get("coinglass_oi_funding", {})
+    if cg.get("available"):
+        cg_assessment = cg.get("assessment", "NORMAL")
+        alert_conditions = (
+            cg_assessment in (
+                # Positive signals (opportunity alerts)
+                "OI_PRICE_DIV_LONG", "PASSIVE_ACCUM", "EXTREME_SHORT_FUNDING",
+                # Caution / bearish signals — Bybit-aware
+                "OI_SPIKE_CAUTION", "OI_SURGE_CAUTION", "OI_TREND_CHASE_BEARISH",
+                "EXTREME_LONG", "HIGH_LONG", "BINANCE_BEARISH_VS_BYBIT",
+                "BOTH_CROWDED_LONG",
+                # Structural alerts
+                "SETTLEMENT_IMMINENT",
+            )
+        )
+        if alert_conditions and _is_cooled_down(state, "proj_oi_spike", 2):
+            severity = "high" if cg_assessment in (
+                "OI_SPIKE_CAUTION", "OI_TREND_CHASE_BEARISH", "SETTLEMENT_IMMINENT",
+                "EXTREME_LONG", "OI_PRICE_DIV_LONG", "BINANCE_BEARISH_VS_BYBIT",
+            ) else "medium"
+            m5 = cg.get("m5_oi_chg", 0)
+            m15 = cg.get("m15_oi_chg", 0)
+            mins_settle = cg.get("mins_to_settle", 999)
+            mean_rate   = cg.get("mean_rate_pct", 0)
+            bybit_rate  = cg.get("bybit_rate", 0)
+            binance_rate = cg.get("binance_rate", 0)
+            daily_carry = cg.get("bybit_daily_carry_pct", bybit_rate * 3)
+            msg = (
+                f"*FARTCOIN OI / FUNDING ALERT*\n\n"
+                f"*Assessment:* {cg_assessment}\n"
+                f"*OI Change:* 5m: {m5:+.1f}% / 15m: {m15:+.1f}%\n"
+                f"*OI/Vol Ratio:* {cg.get('oi_vol_ratio', 0):.2f} "
+                f"({cg.get('oi_direction', 'N/A')})\n"
+                f"*Bybit Rate:* {bybit_rate:+.3f}%/8h (carry: {daily_carry:+.2f}%/day)\n"
+                f"*Binance Rate:* {binance_rate:+.3f}% "
+                f"({'↓ bearish vs Bybit' if binance_rate < bybit_rate - 0.3 else '≈ aligned'})\n"
+            )
+            if cg.get("settlement_imminent"):
+                msg += f"*Settlement in:* {mins_settle:.0f} min ⚡\n"
+            if cg.get("spread_pct", 0) > 1.0:
+                msg += f"*Funding Spread:* {cg.get('spread_pct', 0):.3f}%\n"
+            msg += f"\n{cg.get('description', '')}"
+            alerts.append({
+                "type": "proj_oi_spike",
+                "severity": severity,
+                "title": f"Coinglass OI/Funding: {cg_assessment}",
+                "message": msg,
+            })
+            _fire(state, "proj_oi_spike")
+
+    # --- Rule P9: Funding Settlement Cycle pre-settlement warning ---
+    settlement = projections.get("funding_settlement", {})
+    s_phase = settlement.get("phase", "MID_CYCLE")
+    s_conf = settlement.get("confidence", 0)
+    s_effect = settlement.get("expected_effect", "UNKNOWN")
+    s_mins = settlement.get("mins_to_settlement", 999)
+    if s_phase == "PRE_SETTLEMENT" and s_conf > 0.5 and s_mins <= 30 and \
+            _is_cooled_down(state, "proj_settlement_cycle", 8):
+        direction_word = "BEARISH pressure" if "DOWN" in s_effect else "BULLISH pressure" if "UP" in s_effect else "price action"
+        msg = (
+            f"*FARTCOIN SETTLEMENT CYCLE ALERT*\n\n"
+            f"*Phase:* PRE-SETTLEMENT ({s_mins:.0f}min to next settlement)\n"
+            f"*Funding:* {settlement.get('current_funding_sign','?')} → {direction_word}\n"
+            f"*Historical pre-settlement avg:* {settlement.get('pre_ret_mean', 0):+.2f}%\n"
+            f"*Post-settlement avg:* {settlement.get('post_ret_mean', 0):+.2f}%\n"
+            f"*Confidence:* {s_conf:.0%} (n={settlement.get('historical_n',0)})\n\n"
+            f"{settlement.get('description', '')}"
+        )
+        alerts.append({
+            "type": "proj_settlement_cycle",
+            "severity": "medium",
+            "title": f"Settlement in {s_mins:.0f}min — {direction_word}",
+            "message": msg,
+        })
+        _fire(state, "proj_settlement_cycle")
+
+    # --- Rule P10: Liquidation Cascade entry window ---
+    liq_cas = projections.get("liq_cascade", {})
+    lc_state = liq_cas.get("state", "NORMAL")
+    lc_conf = liq_cas.get("confidence", 0)
+    if lc_state == "CASCADE_IN_PROGRESS" and _is_cooled_down(state, "proj_cascade_active", 2):
+        msg = (
+            f"*FARTCOIN LIQUIDATION CASCADE ALERT*\n\n"
+            f"*State:* CASCADE IN PROGRESS — do NOT enter long\n"
+            f"*Liq z-score:* {liq_cas.get('liq_zscore', 0):.1f}σ\n"
+            f"*Wick ratio:* {liq_cas.get('wick_ratio', 0):.1f}x body\n"
+            f"*Volume spike:* {liq_cas.get('volume_ratio', 0):.1f}x avg\n\n"
+            f"Wait for wick candle to complete, then watch for post-cascade entry.\n"
+            f"{liq_cas.get('description', '')}"
+        )
+        alerts.append({
+            "type": "proj_cascade_active",
+            "severity": "high",
+            "title": f"Liquidation cascade: {liq_cas.get('liq_zscore',0):.1f}σ",
+            "message": msg,
+        })
+        _fire(state, "proj_cascade_active")
+
+    elif lc_state == "POST_CASCADE_ENTRY" and lc_conf > 0.4 and \
+            _is_cooled_down(state, "proj_cascade_entry", 4):
+        avg_4h = liq_cas.get("post_cascade_avg_4h", 0)
+        hit = liq_cas.get("post_cascade_hit_rate", 0)
+        n = liq_cas.get("historical_n", 0)
+        msg = (
+            f"*FARTCOIN POST-CASCADE ENTRY ALERT*\n\n"
+            f"*State:* POST-CASCADE ENTRY WINDOW\n"
+            f"*Candles since cascade:* {liq_cas.get('candles_since_cascade', '?')}\n"
+            f"*Historical 4h return:* {avg_4h:+.1f}% avg, {hit:.0%} hit rate (n={n})\n"
+            f"*Confidence:* {lc_conf:.0%}\n\n"
+            f"Forced sellers exhausted. High-probability long setup.\n"
+            f"{liq_cas.get('description', '')}"
+        )
+        alerts.append({
+            "type": "proj_cascade_entry",
+            "severity": "high",
+            "title": f"Post-cascade entry window ({hit:.0%} hist hit rate)",
+            "message": msg,
+        })
+        _fire(state, "proj_cascade_entry")
 
     _save_cooldowns(state)
     return alerts

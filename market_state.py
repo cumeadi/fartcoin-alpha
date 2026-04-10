@@ -6,7 +6,8 @@ No Streamlit dependency — pure Python + pandas.
 """
 
 import numpy as np
-from datetime import datetime, timezone
+import pandas as pd
+from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
 # Session Constants
@@ -35,6 +36,25 @@ ASIA_DAY_BPS = {
     "Mon": 3.2, "Tue": -13.1, "Wed": 2.6, "Thu": -34.8,
     "Fri": 10.9, "Sat": -24.5, "Sun": -17.3,
 }
+
+def is_weekend(dt_utc):
+    """
+    Returns True if current time is weekend (Fri 17:00 ET to Sun 17:00 ET).
+    ET is UTC-5 or UTC-4 depending on DST. For simplicity, assume UTC-5 here
+    (standard) or calculate based on 22:00 UTC Fri to 22:00 UTC Sun.
+    """
+    # 22:00 UTC Friday is 5 PM ET
+    # 22:00 UTC Sunday is 5 PM ET
+    weekday = dt_utc.weekday()  # 0=Mon, 4=Fri, 6=Sun
+    hour = dt_utc.hour
+
+    if weekday == 4 and hour >= 22:
+        return True
+    if weekday == 5:
+        return True
+    if weekday == 6 and hour < 22:
+        return True
+    return False
 
 
 def classify_session(hour):
@@ -75,6 +95,7 @@ def compute_market_state(data):
     state["weekday_short"] = now.strftime("%a")
     state["asia_sub"] = classify_asia_sub(now.hour)
     state["asia_day_bps"] = ASIA_DAY_BPS.get(state["weekday_short"], 0)
+    state["is_weekend"] = is_weekend(now)
 
     # Compute Late NYC carry (prior 3h momentum)
     ohlcv_carry = data.get("ohlcv")
@@ -115,6 +136,11 @@ def compute_market_state(data):
         if state["funding_range"] > 0.05: risk += 1
         top_share = active["open_interest_usd"].max() / state["total_oi"]
         if top_share > 0.3: risk += 1
+        
+        # Weekend Risk: Thinner liquidity + manipulation hunt
+        if state.get("is_weekend"):
+            risk += 1
+            
         state["risk_score"] = risk
     else:
         state["avg_funding"] = 0
@@ -183,8 +209,12 @@ def determine_action(state):
     session_ok = True
     session_note = ""
     asia_note = ""
+    weekend_note = ""
 
-    if session == "Asia":
+    if state.get("is_weekend"):
+        weekend_note = "WEEKEND REGIME: Thinner liquidity. Spreads likely wider. MMs hunting stops."
+        if direction != "FLAT":
+            conviction = "LOW" if conviction == "MEDIUM" else conviction
         weekday_short = state.get("weekday_short", "")
         asia_sub = state.get("asia_sub", "")
         asia_day_bps = state.get("asia_day_bps", 0)
@@ -279,8 +309,10 @@ def determine_action(state):
         "session_ok": session_ok,
         "session_note": session_note,
         "asia_note": asia_note,
+        "weekend_note": weekend_note,
         "funding_note": funding_note,
         "btc_note": btc_note,
         "timing": timing,
         "exit_plan": exit_plan,
+        "is_weekend": state.get("is_weekend", False),
     }

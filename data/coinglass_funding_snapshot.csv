@@ -1,0 +1,4 @@
+timestamp,available,max_rate_pct,min_rate_pct,mean_rate_pct,spread_pct,mean_predicted_pct,pred_vs_current_delta,min_mins_to_settle,n_exchanges,settlement_imminent,funding_extreme,funding_divergence,predicted_shift,binance_rate,bybit_rate,okx_rate,bitget_rate,hyperliquid_rate,binance_predicted,bybit_mins_to_settle,binance_mins_to_settle
+2026-04-07T19:58:11.621838+00:00,True,1.54,-1.0,0.583,2.54,0.583,0.0,1.3,15,True,EXTREME_SHORT,HIGH_SPREAD,STABLE,1.0223,0.5,0.5,0.5,0.125,0,1.8,1.8
+2026-04-10T14:21:14.168089+00:00,True,1.0,-0.56,0.3743,1.56,0.3743,0.0,38.8,15,False,EXTREME_SHORT,ELEVATED_SPREAD,STABLE,0.5,0.5,0.5,0.5,0.125,0,98.8,98.8
+2026-04-10T15:37:43.011808+00:00,True,0.3232,-13.4486,-4.6267,13.7718,-4.6267,0.0,21.5,15,True,EXTREME_SHORT,HIGH_SPREAD,STABLE,-4.7189,-5.57,-7.4232,-3.96,0.0005,0,22.3,22.3

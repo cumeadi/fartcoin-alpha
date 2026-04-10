@@ -28,9 +28,19 @@ from pathlib import Path
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# FARTCOIN identifiers
+# FARTCOIN identifiers (kept for backward compat and Helius/Solana-specific calls)
 FARTCOIN_MINT = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
 FARTCOIN_TICKER = "FARTCOIN"
+
+try:
+    from coin_config import get_config, DEFAULT_COIN
+except ImportError:
+    DEFAULT_COIN = "FARTCOIN"
+    def get_config(coin):
+        return {"cmc_symbol": coin, "perp_symbol": f"{coin}USDT",
+                "cg_coin_id": coin.lower(), "cp_coin_id": coin.lower(),
+                "coinglass_ticker": coin, "coinalyze_symbols": [f"{coin}USDT_PERP.A"],
+                "blockchain": "unknown"}
 
 # Known exchange deposit wallets (Solana) — expand this over time
 # These are well-known hot wallets; transfers TO these = selling pressure
@@ -260,7 +270,7 @@ def fetch_coinpaprika_granular(coin_id="fartcoin-fartcoin"):
     return result
 
 
-def collect_sentiment():
+def collect_sentiment(cg_coin_id="fartcoin", cp_coin_id="fartcoin-fartcoin"):
     """
     Collect all sentiment data from the 3 free APIs and combine into
     a single snapshot for signal consumption.
@@ -273,8 +283,8 @@ def collect_sentiment():
 
     # Fetch all three
     fear_greed = fetch_fear_greed_index(limit=7)
-    cg_community = fetch_coingecko_community()
-    paprika = fetch_coinpaprika_granular()
+    cg_community = fetch_coingecko_community(coin_id=cg_coin_id)
+    paprika = fetch_coinpaprika_granular(coin_id=cp_coin_id)
 
     if not fear_greed and not cg_community and not paprika:
         print("  [Sentiment] All sources failed")
@@ -632,14 +642,21 @@ def _append_flow_metrics(transfers_df):
 
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 
-# FARTCOIN futures symbols across exchanges
-# Format: BASE_QUOTE_EXCHANGE  (Coinalyze convention)
+# Default Coinalyze symbols (FARTCOIN). Overridden at call time via coin config.
 COINALYZE_SYMBOLS = [
     "FARTCOINUSDT_PERP.A",   # Binance
     "FARTCOINUSDT.6",         # Bybit
     "FARTCOINUSDT_PERP.3",   # OKX
     "FARTCOINUSDT_PERP.4",   # Bitget
 ]
+
+
+def _coinalyze_symbols_for(coin: str) -> list:
+    """Return Coinalyze symbol list for the given coin config key."""
+    try:
+        return get_config(coin)["coinalyze_symbols"]
+    except Exception:
+        return COINALYZE_SYMBOLS
 
 
 def _coinalyze_headers():
@@ -650,7 +667,7 @@ def _coinalyze_headers():
     return {}
 
 
-def fetch_coinalyze_oi_history(hours=168):
+def fetch_coinalyze_oi_history(hours=168, coin=DEFAULT_COIN):
     """
     Fetch aggregated open interest history across exchanges.
 
@@ -663,7 +680,7 @@ def fetch_coinalyze_oi_history(hours=168):
         print("  [Coinalyze] Get free key at: https://coinalyze.net/")
         return pd.DataFrame()
 
-    symbols = ",".join(COINALYZE_SYMBOLS)
+    symbols = ",".join(_coinalyze_symbols_for(coin))
     now = int(datetime.now(timezone.utc).timestamp())
     start = now - (hours * 3600)
 
@@ -714,7 +731,7 @@ def fetch_coinalyze_oi_history(hours=168):
     return pivot
 
 
-def fetch_coinalyze_funding_history(hours=168):
+def fetch_coinalyze_funding_history(hours=168, coin=DEFAULT_COIN):
     """
     Fetch funding rate history across exchanges.
 
@@ -726,7 +743,7 @@ def fetch_coinalyze_funding_history(hours=168):
         print("  [Coinalyze] No API key — set COINALYZE_API_KEY")
         return pd.DataFrame()
 
-    symbols = ",".join(COINALYZE_SYMBOLS)
+    symbols = ",".join(_coinalyze_symbols_for(coin))
     now = int(datetime.now(timezone.utc).timestamp())
     start = now - (hours * 3600)
 
@@ -777,7 +794,7 @@ def fetch_coinalyze_funding_history(hours=168):
     return pivot
 
 
-def fetch_coinalyze_liquidations(hours=168):
+def fetch_coinalyze_liquidations(hours=168, coin=DEFAULT_COIN):
     """
     Fetch liquidation history — shows where leveraged positions get wiped.
 
@@ -789,7 +806,7 @@ def fetch_coinalyze_liquidations(hours=168):
         print("  [Coinalyze] No API key — set COINALYZE_API_KEY")
         return pd.DataFrame()
 
-    symbols = ",".join(COINALYZE_SYMBOLS)
+    symbols = ",".join(_coinalyze_symbols_for(coin))
     now = int(datetime.now(timezone.utc).timestamp())
     start = now - (hours * 3600)
 
@@ -849,7 +866,7 @@ def fetch_coinalyze_liquidations(hours=168):
     return hourly
 
 
-def fetch_coinalyze_predicted_funding():
+def fetch_coinalyze_predicted_funding(coin=DEFAULT_COIN):
     """
     Fetch predicted funding rates — unique to Coinalyze.
     Shows what funding WILL be at next settlement, before it happens.
@@ -862,7 +879,7 @@ def fetch_coinalyze_predicted_funding():
         print("  [Coinalyze] No API key — set COINALYZE_API_KEY")
         return pd.DataFrame()
 
-    symbols = ",".join(COINALYZE_SYMBOLS)
+    symbols = ",".join(_coinalyze_symbols_for(coin))
     now = int(datetime.now(timezone.utc).timestamp())
     start = now - (72 * 3600)  # Last 3 days
 
@@ -909,41 +926,497 @@ def fetch_coinalyze_predicted_funding():
 
 
 # ===========================================================================
+# Coinglass — Multi-Exchange OI Momentum + Funding Snapshot
+# ===========================================================================
+
+COINGLASS_V2_BASE = "https://open-api.coinglass.com/public/v2"
+
+
+def fetch_coinglass_oi_snapshot(coin=DEFAULT_COIN):
+    """
+    Fetch open interest snapshot from Coinglass v2 free tier.
+
+    Returns multi-timeframe OI & volume change %, OI/vol ratio, avg funding.
+    Saves to data/coinglass_oi_snapshot.csv (appended rows, 1 per call).
+
+    Signals extracted:
+      - m5/m15 OI spike → leveraged position buildup in real-time
+      - h4OIChangePercent surge → trend-aligned OI growth (strong move)
+      - oiVolRadio > 0.8 → leverage-heavy (fragile, snap-back risk)
+      - Divergence: OI up + vol down → passive accumulation (strong)
+      - Divergence: OI up + vol up → trend chase (can exhaust)
+    """
+    api_key = os.environ.get("COINGLASS_API_KEY", "")
+    if not api_key:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent / ".env")
+            api_key = os.environ.get("COINGLASS_API_KEY", "")
+        except ImportError:
+            pass
+
+    headers = {"coinglassSecret": api_key}
+    data = _safe_request(
+        f"{COINGLASS_V2_BASE}/open_interest",
+        params={"symbol": get_config(coin)["coinglass_ticker"]},
+        headers=headers,
+        name="Coinglass/OI",
+    )
+
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "available": False,
+    }
+
+    if not data or data.get("code") != "0":
+        print(f"  [Coinglass/OI] Failed: {data.get('msg', 'no response') if data else 'no response'}")
+        return result
+
+    items = data.get("data", [])
+    _ticker = get_config(coin)["coinglass_ticker"]
+    fart = next((x for x in items if x.get("symbol") == _ticker), None)
+    if not fart:
+        # Sometimes returned as the only item (when symbol filter works)
+        fart = items[0] if items else None
+    if not fart:
+        print(f"  [Coinglass/OI] {get_config(coin)['coinglass_ticker']} not found in response")
+        return result
+
+    # Extract OI metrics
+    oi_usd        = float(fart.get("openInterest", 0))
+    oi_amount     = float(fart.get("openInterestAmount", 0))  # in tokens
+    m5_oi_chg     = float(fart.get("m5OIChangePercent", 0))
+    m15_oi_chg    = float(fart.get("m15OIChangePercent", 0))
+    m30_oi_chg    = float(fart.get("m30OIChangePercent", 0))
+    h1_oi_chg     = float(fart.get("h1OIChangePercent", 0))
+    h4_oi_chg     = float(fart.get("h4OIChangePercent", 0))
+    h24_oi_chg    = float(fart.get("oichangePercent", 0))
+
+    # Volume metrics
+    vol_usd       = float(fart.get("volUsd", 0))
+    m5_vol_chg    = float(fart.get("m5VolChangePercent", 0))
+    m15_vol_chg   = float(fart.get("m15VolChangePercent", 0))
+    h1_vol_chg    = float(fart.get("h1VolChangePercent", 0))
+    h4_vol_chg    = float(fart.get("h4VolChangePercent", 0))
+    h24_vol_chg   = float(fart.get("volChangePercent", 0))
+
+    # Leverage ratios
+    oi_vol_ratio          = float(fart.get("oiVolRadio", 0))
+    oi_vol_ratio_h1_chg   = float(fart.get("oiVolRadioH1ChangePercent", 0))
+    oi_vol_ratio_h4_chg   = float(fart.get("oiVolRadioH4ChangePercent", 0))
+    avg_funding           = float(fart.get("avgFundingRate", 0))
+    avg_funding_by_vol    = float(fart.get("avgFundingRateByVol", 0))
+
+    # --- Derived signals ---
+    # OI momentum z-score proxy: short-term vs hourly
+    oi_momentum_score = (m5_oi_chg * 2 + m15_oi_chg + m30_oi_chg * 0.5) / 3.5
+
+    # Leverage pressure: OI/Vol ratio above 0.7 = crowded
+    leverage_flag = "HIGH" if oi_vol_ratio > 0.8 else ("ELEVATED" if oi_vol_ratio > 0.6 else "NORMAL")
+
+    # OI spike detection: unusual short-term OI surge
+    if abs(m5_oi_chg) > 2.0:
+        oi_spike = "SPIKE_5M"
+    elif abs(m15_oi_chg) > 3.5:
+        oi_spike = "SPIKE_15M"
+    elif abs(h1_oi_chg) > 8.0:
+        oi_spike = "SURGE_1H"
+    else:
+        oi_spike = "NORMAL"
+
+    # OI/Vol divergence
+    if h1_oi_chg > 3 and h1_vol_chg < 1:
+        oi_vol_divergence = "PASSIVE_ACCUM"    # OI builds quietly → strong conviction
+    elif h1_oi_chg > 3 and h1_vol_chg > 5:
+        oi_vol_divergence = "TREND_CHASE"      # Both surge → exhaustion risk
+    elif h1_oi_chg < -3 and h1_vol_chg > 5:
+        oi_vol_divergence = "DELEVERAGE"       # OI drops, vol spikes → forced unwind
+    else:
+        oi_vol_divergence = "NORMAL"
+
+    direction_flag = "BULLISH" if oi_momentum_score > 1.5 else ("BEARISH" if oi_momentum_score < -1.5 else "NEUTRAL")
+
+    result.update({
+        "available": True,
+        "oi_usd": round(oi_usd, 0),
+        "oi_amount_tokens": round(oi_amount, 0),
+        "m5_oi_chg": round(m5_oi_chg, 3),
+        "m15_oi_chg": round(m15_oi_chg, 3),
+        "m30_oi_chg": round(m30_oi_chg, 3),
+        "h1_oi_chg": round(h1_oi_chg, 3),
+        "h4_oi_chg": round(h4_oi_chg, 3),
+        "h24_oi_chg": round(h24_oi_chg, 3),
+        "vol_usd": round(vol_usd, 0),
+        "m5_vol_chg": round(m5_vol_chg, 3),
+        "m15_vol_chg": round(m15_vol_chg, 3),
+        "h1_vol_chg": round(h1_vol_chg, 3),
+        "h4_vol_chg": round(h4_vol_chg, 3),
+        "h24_vol_chg": round(h24_vol_chg, 3),
+        "oi_vol_ratio": round(oi_vol_ratio, 4),
+        "oi_vol_ratio_h1_chg": round(oi_vol_ratio_h1_chg, 3),
+        "oi_vol_ratio_h4_chg": round(oi_vol_ratio_h4_chg, 3),
+        "avg_funding": round(avg_funding, 6),
+        "avg_funding_by_vol": round(avg_funding_by_vol, 6),
+        "oi_momentum_score": round(oi_momentum_score, 3),
+        "leverage_flag": leverage_flag,
+        "oi_spike": oi_spike,
+        "oi_vol_divergence": oi_vol_divergence,
+        "direction_flag": direction_flag,
+    })
+
+    # Append to history CSV
+    row = {"timestamp": result["timestamp"], **{k: v for k, v in result.items() if k != "timestamp"}}
+    df_row = pd.DataFrame([row])
+    csv_path = DATA_DIR / "coinglass_oi_snapshot.csv"
+    if csv_path.exists():
+        df_row.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(csv_path, index=False)
+
+    print(
+        f"  [Coinglass/OI] OI: ${oi_usd/1e6:.1f}M | "
+        f"5m: {m5_oi_chg:+.1f}% | 15m: {m15_oi_chg:+.1f}% | 1h: {h1_oi_chg:+.1f}% | "
+        f"OI/Vol: {oi_vol_ratio:.2f} ({leverage_flag}) | {oi_spike} | {oi_vol_divergence}"
+    )
+    return result
+
+
+def fetch_coinglass_funding_snapshot(coin=DEFAULT_COIN):
+    """
+    Fetch per-exchange funding rates from Coinglass v2 free tier.
+
+    Returns cross-exchange funding spread, predicted rate divergence,
+    and time-to-settlement signals.
+
+    Signals:
+      - Funding spread > 1% between exchanges → arb or manipulation
+      - Predicted vs current divergence → imminent rate shift
+      - nextFundingTime < 30min → settlement risk, potential pin or spike
+      - Max rate > 3% or min rate < -1% → extreme one-sided positioning
+    """
+    api_key = os.environ.get("COINGLASS_API_KEY", "")
+    if not api_key:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent / ".env")
+            api_key = os.environ.get("COINGLASS_API_KEY", "")
+        except ImportError:
+            pass
+
+    headers = {"coinglassSecret": api_key}
+    data = _safe_request(
+        f"{COINGLASS_V2_BASE}/funding",
+        params={"symbol": get_config(coin)["coinglass_ticker"]},
+        headers=headers,
+        name="Coinglass/Funding",
+    )
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "available": False,
+    }
+
+    if not data or data.get("code") != "0":
+        print(f"  [Coinglass/Funding] Failed: {data.get('msg', 'no response') if data else 'no response'}")
+        return result
+
+    items = data.get("data", [])
+    _ticker = get_config(coin)["coinglass_ticker"]
+    fart = next((x for x in items if x.get("symbol") == _ticker), None)
+    if not fart:
+        fart = items[0] if items else None
+    if not fart:
+        print(f"  [Coinglass/Funding] {get_config(coin)['coinglass_ticker']} not found")
+        return result
+
+    margin_list = fart.get("uMarginList", [])
+    active = [x for x in margin_list if x.get("status") == 1 and x.get("rate") is not None]
+
+    if not active:
+        return result
+
+    rates = [float(x["rate"]) for x in active]
+    predicted = [float(x["predictedRate"]) for x in active
+                 if x.get("predictedRate") is not None]
+    next_times = [int(x["nextFundingTime"]) for x in active
+                  if x.get("nextFundingTime") is not None]
+
+    # Per-exchange breakdown (top exchanges)
+    PRIORITY = ["Binance", "Bybit", "OKX", "Bitget", "KuCoin", "Hyperliquid"]
+    ex_rates = {}
+    ex_predicted = {}
+    ex_mins_to_settle = {}
+    for x in margin_list:
+        name = x.get("exchangeName", "")
+        if x.get("rate") is not None:
+            ex_rates[name] = float(x["rate"])
+        if x.get("predictedRate") is not None:
+            ex_predicted[name] = float(x["predictedRate"])
+        if x.get("nextFundingTime"):
+            mins = (int(x["nextFundingTime"]) - now_ms) / 60000
+            ex_mins_to_settle[name] = round(mins, 1)
+
+    max_rate       = max(rates) * 100           # pct
+    min_rate       = min(rates) * 100
+    mean_rate      = sum(rates) / len(rates) * 100
+    spread         = max_rate - min_rate
+    mean_predicted = (sum(predicted) / len(predicted) * 100) if predicted else mean_rate
+    pred_vs_current_delta = mean_predicted - mean_rate
+    min_mins_to_settle = min((v for v in ex_mins_to_settle.values() if v > 0), default=999)
+
+    # --- Derived signals ---
+    if max_rate > 3.0:
+        funding_extreme = "EXTREME_LONG"
+    elif min_rate < -0.5:
+        funding_extreme = "EXTREME_SHORT"
+    elif mean_rate > 1.5:
+        funding_extreme = "HIGH_LONG"
+    else:
+        funding_extreme = "NORMAL"
+
+    if spread > 2.0:
+        funding_divergence = "HIGH_SPREAD"
+    elif spread > 1.0:
+        funding_divergence = "ELEVATED_SPREAD"
+    else:
+        funding_divergence = "NORMAL"
+
+    # Predicted shift: if predicted >> current, longs about to pay more
+    if pred_vs_current_delta > 1.0:
+        predicted_shift = "RATE_RISING"
+    elif pred_vs_current_delta < -1.0:
+        predicted_shift = "RATE_FALLING"
+    else:
+        predicted_shift = "STABLE"
+
+    settlement_imminent = min_mins_to_settle < 30
+
+    result.update({
+        "available": True,
+        "max_rate_pct": round(max_rate, 4),
+        "min_rate_pct": round(min_rate, 4),
+        "mean_rate_pct": round(mean_rate, 4),
+        "spread_pct": round(spread, 4),
+        "mean_predicted_pct": round(mean_predicted, 4),
+        "pred_vs_current_delta": round(pred_vs_current_delta, 4),
+        "min_mins_to_settle": round(min_mins_to_settle, 1),
+        "n_exchanges": len(active),
+        "settlement_imminent": settlement_imminent,
+        "funding_extreme": funding_extreme,
+        "funding_divergence": funding_divergence,
+        "predicted_shift": predicted_shift,
+        # Top-6 exchange snapshot
+        "binance_rate": round(ex_rates.get("Binance", 0) * 100, 4),
+        "bybit_rate": round(ex_rates.get("Bybit", 0) * 100, 4),
+        "okx_rate": round(ex_rates.get("OKX", 0) * 100, 4),
+        "bitget_rate": round(ex_rates.get("Bitget", 0) * 100, 4),
+        "hyperliquid_rate": round(ex_rates.get("Hyperliquid", 0) * 100, 4),
+        "binance_predicted": round(ex_predicted.get("Binance", 0) * 100, 4),
+        "bybit_mins_to_settle": ex_mins_to_settle.get("Bybit"),
+        "binance_mins_to_settle": ex_mins_to_settle.get("Binance"),
+    })
+
+    # Append to history CSV
+    row = {"timestamp": result["timestamp"], **{k: v for k, v in result.items() if k != "timestamp"}}
+    df_row = pd.DataFrame([row])
+    csv_path = DATA_DIR / "coinglass_funding_snapshot.csv"
+    if csv_path.exists():
+        df_row.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(csv_path, index=False)
+
+    settle_str = f"settle in {min_mins_to_settle:.0f}m" if settlement_imminent else f"{min_mins_to_settle:.0f}m to settle"
+    print(
+        f"  [Coinglass/Funding] Mean: {mean_rate:+.3f}% | Spread: {spread:.3f}% | "
+        f"Predicted: {mean_predicted:+.3f}% (Δ{pred_vs_current_delta:+.3f}%) | "
+        f"{settle_str} | {funding_extreme} | {funding_divergence}"
+    )
+    return result
+
+
+def fetch_coinglass_liquidation_snapshot(coin=DEFAULT_COIN):
+    """
+    Fetch real-time liquidation data from Coinglass v2 free tier.
+
+    Endpoint: /public/v2/liquidation_chart
+    Returns per-interval long/short liquidation amounts with z-score detection.
+
+    Cascade fingerprint:
+    - Long liq z-score > 2σ: forced long sellers hit market (potential buy)
+    - Short liq z-score > 2σ: forced short buyers (potential sell)
+    - Total liq spike: volatility regime, wait for dust to settle
+    """
+    api_key = os.environ.get("COINGLASS_API_KEY", "")
+    if not api_key:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent / ".env")
+            api_key = os.environ.get("COINGLASS_API_KEY", "")
+        except ImportError:
+            pass
+
+    if not api_key:
+        return {"available": False}
+
+    headers = {"coinglassSecret": api_key}
+
+    # Try liquidation chart endpoint (aggregated, free tier)
+    data = _safe_request(
+        f"{COINGLASS_V2_BASE}/liquidation_chart",
+        params={"symbol": get_config(coin)["coinglass_ticker"], "interval": "1h"},
+        headers=headers,
+        name="Coinglass/Liquidations",
+    )
+
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "available": False,
+    }
+
+    if not data or data.get("code") != "0":
+        # Endpoint may not be available on free tier — log and return
+        print(f"  [Coinglass/Liq] Not available: {data.get('msg', 'no response') if data else 'timeout'}")
+        return result
+
+    liq_data = data.get("data", {})
+    if not liq_data:
+        return result
+
+    # Parse long/short liquidation series
+    long_liqs = liq_data.get("buyLiquidationChart", [])  # longs getting liquidated
+    short_liqs = liq_data.get("sellLiquidationChart", [])  # shorts getting liquidated
+
+    if not long_liqs and not short_liqs:
+        return result
+
+    # Build DataFrame
+    rows = []
+    all_times = sorted(set(
+        [x[0] for x in long_liqs] + [x[0] for x in short_liqs]
+    ))
+    long_map = {x[0]: float(x[1]) for x in long_liqs}
+    short_map = {x[0]: float(x[1]) for x in short_liqs}
+
+    for ts_ms in all_times:
+        long_usd = long_map.get(ts_ms, 0)
+        short_usd = short_map.get(ts_ms, 0)
+        rows.append({
+            "timestamp": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+            "long_liquidations_usd": long_usd,
+            "short_liquidations_usd": short_usd,
+            "total_liquidations_usd": long_usd + short_usd,
+        })
+
+    if not rows:
+        return result
+
+    df = pd.DataFrame(rows).sort_values("timestamp")
+
+    # Z-score relative to last 24 periods
+    rolling_mean = df["total_liquidations_usd"].rolling(24, min_periods=3).mean()
+    rolling_std = df["total_liquidations_usd"].rolling(24, min_periods=3).std().replace(0, 1)
+    df["liq_zscore"] = (df["total_liquidations_usd"] - rolling_mean) / rolling_std
+
+    # Current window (most recent row)
+    latest = df.iloc[-1]
+    long_usd = float(latest["long_liquidations_usd"])
+    short_usd = float(latest["short_liquidations_usd"])
+    total_usd = float(latest["total_liquidations_usd"])
+    liq_z = float(latest["liq_zscore"]) if not pd.isna(latest["liq_zscore"]) else 0.0
+
+    # Cascade classification
+    if liq_z > 2.5:
+        cascade_type = "LONG_CASCADE" if long_usd > short_usd * 2 else \
+                       "SHORT_CASCADE" if short_usd > long_usd * 2 else "MIXED_CASCADE"
+    elif liq_z > 1.5:
+        cascade_type = "ELEVATED"
+    else:
+        cascade_type = "NORMAL"
+
+    result.update({
+        "available": True,
+        "long_liquidations_usd": round(long_usd, 0),
+        "short_liquidations_usd": round(short_usd, 0),
+        "total_liquidations_usd": round(total_usd, 0),
+        "liq_zscore": round(liq_z, 2),
+        "cascade_type": cascade_type,
+        "n_periods": len(df),
+    })
+
+    # Save to CSV (append)
+    row_save = {
+        "timestamp": result["timestamp"],
+        **{k: v for k, v in result.items() if k not in ("timestamp", "available")},
+    }
+    df_row = pd.DataFrame([row_save])
+    csv_path = DATA_DIR / "coinglass_liquidation_snapshot.csv"
+    if csv_path.exists():
+        df_row.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(csv_path, index=False)
+
+    print(
+        f"  [Coinglass/Liq] Long: ${long_usd/1000:.1f}K | Short: ${short_usd/1000:.1f}K | "
+        f"Total: ${total_usd/1000:.1f}K | z-score: {liq_z:.1f}σ | {cascade_type}"
+    )
+    return result
+
+
+# ===========================================================================
 # Master Collector
 # ===========================================================================
 
-def collect_all_external():
-    """Run all external data collectors."""
+def collect_all_external(coin=DEFAULT_COIN):
+    """Run all external data collectors for the given coin."""
+    cfg = get_config(coin)
+    is_solana = cfg.get("blockchain") == "solana"
+
     print("=" * 70)
-    print("EXTERNAL DATA COLLECTION")
+    print(f"EXTERNAL DATA COLLECTION — {cfg['display_name']}")
     print("=" * 70)
     print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     results = {}
 
     # --- 1. Sentiment & Hype Detection ---
-    print("\n[1/3] Sentiment — Fear & Greed + CoinGecko + CoinPaprika")
+    print("\n[1/4] Sentiment — Fear & Greed + CoinGecko + CoinPaprika")
     print("-" * 40)
-    results["sentiment"] = collect_sentiment()
+    results["sentiment"] = collect_sentiment(
+        cg_coin_id=cfg["cg_coin_id"],
+        cp_coin_id=cfg["cp_coin_id"],
+    )
 
-    # --- 2. Helius On-Chain ---
-    print("\n[2/3] Helius — Solana On-Chain")
+    # --- 2. Helius On-Chain (Solana only) ---
+    print("\n[2/4] Helius — Solana On-Chain")
     print("-" * 40)
-    holders_df, holder_metrics = fetch_helius_holders()
-    results["holders"] = holders_df
-    results["holder_metrics"] = holder_metrics
-
-    print()
-    transfers_df = fetch_helius_recent_transfers()
-    results["transfers"] = transfers_df
+    if is_solana:
+        holders_df, holder_metrics = fetch_helius_holders()
+        results["holders"] = holders_df
+        results["holder_metrics"] = holder_metrics
+        print()
+        transfers_df = fetch_helius_recent_transfers()
+        results["transfers"] = transfers_df
+    else:
+        print(f"  [Helius] Skipped — {cfg['display_name']} is not on Solana")
+        results["holders"] = pd.DataFrame()
+        results["holder_metrics"] = {}
+        results["transfers"] = pd.DataFrame()
 
     # --- 3. Coinalyze Multi-Exchange Derivatives ---
-    print("\n[3/3] Coinalyze — Multi-Exchange Derivatives")
+    print("\n[3/4] Coinalyze — Multi-Exchange Derivatives")
     print("-" * 40)
-    results["coinalyze_oi"] = fetch_coinalyze_oi_history()
-    results["coinalyze_funding"] = fetch_coinalyze_funding_history()
-    results["coinalyze_liquidations"] = fetch_coinalyze_liquidations()
-    results["coinalyze_predicted_funding"] = fetch_coinalyze_predicted_funding()
+    results["coinalyze_oi"] = fetch_coinalyze_oi_history(coin=coin)
+    results["coinalyze_funding"] = fetch_coinalyze_funding_history(coin=coin)
+    results["coinalyze_liquidations"] = fetch_coinalyze_liquidations(coin=coin)
+    results["coinalyze_predicted_funding"] = fetch_coinalyze_predicted_funding(coin=coin)
+
+    # --- 4. Coinglass OI Momentum + Funding Spread + Liquidations ---
+    print("\n[4/4] Coinglass — OI Momentum + Cross-Exchange Funding + Liquidations")
+    print("-" * 40)
+    results["coinglass_oi"] = fetch_coinglass_oi_snapshot(coin=coin)
+    results["coinglass_funding"] = fetch_coinglass_funding_snapshot(coin=coin)
+    results["coinglass_liquidations"] = fetch_coinglass_liquidation_snapshot(coin=coin)
 
     # --- Summary ---
     print("\n" + "=" * 70)
@@ -963,25 +1436,34 @@ def collect_all_external():
     return results
 
 
-def collect_light_external():
+def collect_light_external(coin=DEFAULT_COIN):
     """
     Light poll: just the fast, incremental data for scheduled runs.
     Skips historical fetches, focuses on latest state.
     """
+    cfg = get_config(coin)
+    is_solana = cfg.get("blockchain") == "solana"
     results = {}
 
     # Sentiment snapshot
-    results["sentiment"] = collect_sentiment()
+    results["sentiment"] = collect_sentiment(
+        cg_coin_id=cfg["cg_coin_id"],
+        cp_coin_id=cfg["cp_coin_id"],
+    )
 
-    # Holder concentration snapshot
-    holders_df, metrics = fetch_helius_holders()
-    results["holder_metrics"] = metrics
-
-    # Recent transfers
-    results["transfers"] = fetch_helius_recent_transfers()
+    # Holder concentration snapshot (Solana only)
+    if is_solana:
+        holders_df, metrics = fetch_helius_holders()
+        results["holder_metrics"] = metrics
+        results["transfers"] = fetch_helius_recent_transfers()
 
     # Predicted funding (last 3 days, lightweight)
-    results["predicted_funding"] = fetch_coinalyze_predicted_funding()
+    results["predicted_funding"] = fetch_coinalyze_predicted_funding(coin=coin)
+
+    # Coinglass OI + funding (2 fast calls — always include in light poll)
+    results["coinglass_oi"] = fetch_coinglass_oi_snapshot(coin=coin)
+    results["coinglass_funding"] = fetch_coinglass_funding_snapshot(coin=coin)
+    results["coinglass_liquidations"] = fetch_coinglass_liquidation_snapshot(coin=coin)
 
     return results
 
@@ -994,7 +1476,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="External data collectors")
-    parser.add_argument("--source", choices=["sentiment", "helius", "coinalyze", "all"],
+    parser.add_argument("--source", choices=["sentiment", "helius", "coinalyze", "coinglass", "all"],
                         default="all", help="Which source to collect from")
     args = parser.parse_args()
 
@@ -1008,5 +1490,8 @@ if __name__ == "__main__":
         fetch_coinalyze_funding_history()
         fetch_coinalyze_liquidations()
         fetch_coinalyze_predicted_funding()
+    elif args.source == "coinglass":
+        fetch_coinglass_oi_snapshot()
+        fetch_coinglass_funding_snapshot()
     else:
         collect_all_external()

@@ -1,0 +1,4 @@
+timestamp,available,oi_usd,oi_amount_tokens,m5_oi_chg,m15_oi_chg,m30_oi_chg,h1_oi_chg,h4_oi_chg,h24_oi_chg,vol_usd,m5_vol_chg,m15_vol_chg,h1_vol_chg,h4_vol_chg,h24_vol_chg,oi_vol_ratio,oi_vol_ratio_h1_chg,oi_vol_ratio_h4_chg,avg_funding,avg_funding_by_vol,oi_momentum_score,leverage_flag,oi_spike,oi_vol_divergence,direction_flag
+2026-04-07T19:58:10.789590+00:00,True,156111315.0,859807032.0,1.33,2.63,2.52,3.85,5.6,8.53,255280926.0,1.55,3.72,4.9,12.46,-4.66,0.6115,-1.0,-6.1,0.007969,0.007703,1.871,ELEVATED,NORMAL,NORMAL,BULLISH
+2026-04-10T14:21:13.148868+00:00,True,161545467.0,881726923.0,0.45,0.99,1.29,2.49,0.32,-8.22,425065175.0,0.12,0.51,-1.44,-5.58,-72.61,0.38,3.97,6.23,0.005554,0.005039,0.724,NORMAL,NORMAL,NORMAL,NEUTRAL
+2026-04-10T15:37:41.945642+00:00,True,818406305.0,2145676.0,0.03,-0.24,-0.52,1.47,-0.14,23.09,4026671265.0,-1.34,-1.18,1.31,3.31,98.57,0.2032,0.15,-3.38,-0.050814,-0.051217,-0.126,NORMAL,NORMAL,NORMAL,NEUTRAL

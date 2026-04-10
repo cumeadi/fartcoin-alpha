@@ -10,6 +10,11 @@ Entry point: compute_projections(data, market_state) -> dict
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+try:
+    import lightgbm as lgb
+    _LGBM_AVAILABLE = True
+except ImportError:
+    _LGBM_AVAILABLE = False
 from datetime import datetime, timezone
 
 from market_state import (
@@ -37,7 +42,7 @@ def _build_feature_matrix(df, for_prediction=False, state=None):
     """
     Build enriched feature matrix for probability model.
     Features: composite, |composite|, composite², session dummies,
-    hourly_bias, funding z-score, BTC regime flag.
+    hourly_bias, funding z-score, BTC regime flag, day-of-week dummies.
     """
     composite = df["composite"].values
 
@@ -66,6 +71,13 @@ def _build_feature_matrix(df, for_prediction=False, state=None):
         btc_flag = 1.0 if "Rally" in btc_regime else (-1.0 if "Dump" in btc_regime else 0.0)
         features.append(np.array([btc_flag]))
 
+        # Day-of-week: Thu/Fri bearish bias, Monday bullish bias
+        import datetime as _dt
+        now_utc = _dt.datetime.utcnow()
+        dow = now_utc.weekday()  # 0=Mon ... 6=Sun
+        features.append(np.array([1.0 if dow in (3, 4) else 0.0]))  # Thu/Fri
+        features.append(np.array([1.0 if dow == 0 else 0.0]))       # Monday
+
         return np.array([f[0] for f in features]).reshape(1, -1)
 
     # For training: build from DataFrame columns
@@ -89,6 +101,14 @@ def _build_feature_matrix(df, for_prediction=False, state=None):
 
     # BTC regime not available in historical training — use zero
     features.append(np.zeros(len(df)))
+
+    # Day-of-week features: Thu/Fri bearish, Monday bullish
+    if hasattr(df.index, 'dayofweek'):
+        dow = pd.Series(df.index.dayofweek)
+        features.append(dow.isin([3, 4]).astype(float).values)  # Thu/Fri
+        features.append((dow == 0).astype(float).values)         # Monday
+    else:
+        features.extend([np.zeros(len(df))] * 2)
 
     return np.column_stack(features)
 
@@ -125,22 +145,138 @@ def _project_probabilistic_return(data, state):
     if len(df) < 50:
         return result
 
-    # Build enriched feature matrix
-    X = _build_feature_matrix(df)
-    y = (df["fwd_ret_4h"].values > 0).astype(float)
+    # ── Carry-adjusted label ──────────────────────────────────────────────────
+    # Bybit FARTCOIN: 0.5%/8h floor = 0.25% per 4h holding window
+    # Round-trip Bybit taker fees + spread ≈ 0.20%
+    # Label = 1 only when return exceeds total 4h cost of being long on Bybit
+    BYBIT_CARRY_4H  = 0.0025   # 0.25%  — half settlement cycle
+    BYBIT_SLIP_RT   = 0.0020   # 0.20%  — round-trip taker fees + spread
+    BYBIT_COST_4H   = BYBIT_CARRY_4H + BYBIT_SLIP_RT  # 0.45% total hurdle
+    y = (df["fwd_ret_4h"].values > BYBIT_COST_4H).astype(float)
 
-    # Fit logistic regression via L-BFGS-B
-    theta0 = np.zeros(X.shape[1])
-    try:
-        res = minimize(_neg_log_likelihood, theta0, args=(X, y),
-                       method="L-BFGS-B", options={"maxiter": 300})
-        theta = res.x
-    except Exception:
-        return result
+    # ── Extra feature columns on training df ─────────────────────────────────
+    # Price momentum
+    _px = ohlcv.loc[common_idx, price_col]
+    df["mom_1h"] = _px.pct_change(1).reindex(df.index).fillna(0)
+    df["mom_4h"] = _px.pct_change(4).reindex(df.index).fillna(0)
+    df["mom_8h"] = _px.pct_change(8).reindex(df.index).fillna(0)
 
-    # Predict for current state
-    x_now = _build_feature_matrix(df.iloc[-1:], for_prediction=True, state=state)
-    prob = float(_logistic(x_now @ theta).ravel()[0])
+    # Realized vol ratio: recent (6h) vs baseline (24h) — pre-move detector
+    _ret1h = _px.pct_change(1).reindex(df.index)
+    _vol6  = _ret1h.rolling(6, min_periods=3).std()
+    _vol24 = _ret1h.rolling(24, min_periods=12).std().replace(0, np.nan)
+    df["vol_ratio"] = (_vol6 / _vol24).fillna(1.0).clip(0, 5)
+
+    # Bybit settlement proximity (0:00 / 08:00 / 16:00 UTC)
+    def _mins_to_bybit_settle(ts):
+        if not hasattr(ts, "hour"):
+            return 240
+        total_mins = ts.hour * 60 + ts.minute
+        for settle_h in [0, 8, 16, 24]:
+            diff = settle_h * 60 - total_mins
+            if diff > 0:
+                return diff
+        return 480
+
+    if hasattr(df.index, "hour"):
+        _mts = [_mins_to_bybit_settle(ts) for ts in df.index]
+        df["near_settle"] = [1.0 if m <= 30 else 0.0 for m in _mts]
+        df["post_settle"] = [1.0 if m >= 450 else 0.0 for m in _mts]
+    else:
+        df["near_settle"] = 0.0
+        df["post_settle"] = 0.0
+
+    # Additional signal features (all already computed by signal_engine)
+    for _sig in ["sig_oi_accel", "sig_lsr", "sig_taker", "sig_oi_divergence"]:
+        if _sig in signals.columns:
+            df[_sig] = signals.loc[common_idx, _sig].reindex(df.index).fillna(0)
+        else:
+            df[_sig] = 0.0
+
+    EXTRA_COLS = [
+        "mom_1h", "mom_4h", "mom_8h", "vol_ratio",
+        "near_settle", "post_settle",
+        "sig_oi_accel", "sig_lsr", "sig_taker", "sig_oi_divergence",
+    ]
+
+    # Drop rows where key extras are NaN
+    df = df.dropna(subset=["fwd_ret_4h", "composite", "vol_ratio"])
+    y  = (df["fwd_ret_4h"].values > BYBIT_COST_4H).astype(float)  # recompute after dropna
+
+    # ── Build full feature matrix ─────────────────────────────────────────────
+    X_base  = _build_feature_matrix(df)
+    X_extra = df[EXTRA_COLS].fillna(0).values
+    X       = np.hstack([X_base, X_extra])
+
+    # ── Prediction vector — current extra feature values ──────────────────────
+    x_now_base = _build_feature_matrix(df.iloc[-1:], for_prediction=True, state=state)
+
+    # Momentum from latest OHLCV
+    _cur_mom1h = float(_px.pct_change(1).iloc[-1]) if len(_px) > 1 else 0.0
+    _cur_mom4h = float(_px.pct_change(4).iloc[-1]) if len(_px) > 4 else 0.0
+    _cur_mom8h = float(_px.pct_change(8).iloc[-1]) if len(_px) > 8 else 0.0
+    _cur_vol_r = float((_vol6.iloc[-1] / _vol24.iloc[-1])
+                       if not np.isnan(_vol6.iloc[-1]) and not np.isnan(_vol24.iloc[-1])
+                       and _vol24.iloc[-1] > 0 else 1.0)
+    _cur_vol_r = min(max(_cur_vol_r, 0), 5)
+
+    # Settlement proximity from current UTC time
+    import datetime as _dt
+    _now = _dt.datetime.utcnow()
+    _cur_mts = _mins_to_bybit_settle(_now)
+    _cur_near_settle = 1.0 if _cur_mts <= 30 else 0.0
+    _cur_post_settle = 1.0 if _cur_mts >= 450 else 0.0
+
+    # Signal values from latest row
+    def _latest_sig(col):
+        if col in signals.columns:
+            v = signals[col].dropna()
+            return float(v.iloc[-1]) if len(v) > 0 else 0.0
+        return 0.0
+
+    x_extra_now = np.array([[
+        _cur_mom1h, _cur_mom4h, _cur_mom8h, _cur_vol_r,
+        _cur_near_settle, _cur_post_settle,
+        _latest_sig("sig_oi_accel"), _latest_sig("sig_lsr"),
+        _latest_sig("sig_taker"), _latest_sig("sig_oi_divergence"),
+    ]])
+    x_now = np.hstack([x_now_base, x_extra_now])
+
+    # ── Fit model ─────────────────────────────────────────────────────────────
+    if _LGBM_AVAILABLE:
+        clf = lgb.LGBMClassifier(
+            n_estimators=300,
+            learning_rate=0.02,
+            max_depth=5,
+            num_leaves=20,
+            min_child_samples=max(10, len(df) // 30),
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            class_weight="balanced",
+            random_state=42,
+            verbose=-1,
+        )
+        try:
+            clf.fit(X, y)
+            prob = float(clf.predict_proba(x_now)[0][1])
+            feat_imp = dict(enumerate(clf.feature_importances_.tolist()))
+        except Exception:
+            return result
+        model_label = "LightGBM-v2"
+    else:
+        # Fallback: logistic regression via L-BFGS-B (base features only)
+        theta0 = np.zeros(X_base.shape[1])
+        try:
+            res = minimize(_neg_log_likelihood, theta0, args=(X_base, y),
+                           method="L-BFGS-B", options={"maxiter": 300})
+            theta = res.x
+        except Exception:
+            return result
+        prob = float(_logistic(x_now_base @ theta).ravel()[0])
+        feat_imp = {}
+        model_label = "LogReg"
 
     # Expected magnitude: session-specific volatility × sqrt(horizon)
     session = state.get("session", "NYC")
@@ -162,41 +298,72 @@ def _project_probabilistic_return(data, state):
     else:
         expected_move = -expected_magnitude * (0.5 - prob) * 2
 
-    # Apply session-direction filter from backtest findings
+    # Session-direction filters removed — backtest showed they were overfit
     session_warning = ""
-    if session == "London" and prob > 0.5:
-        # London LONG confirmed negative edge (-0.35%) — downgrade
-        prob = 0.5 + (prob - 0.5) * 0.5  # shrink toward 0.5
-        expected_move *= 0.5
-        session_warning = " (London LONG edge is weak — conviction reduced)"
-    elif session == "Late NYC" and prob < 0.5:
-        # Late NYC SHORT is best edge (+1.07%) — upgrade
-        prob = prob * 0.85  # push further bearish
-        expected_move *= 1.3
-        session_warning = " (Late NYC SHORT has strong historical edge — conviction boosted)"
 
-    # Conviction label
-    if prob > 0.65:
-        conviction = "HIGH"
-    elif prob > 0.55:
-        conviction = "MODERATE"
-    elif prob < 0.35:
+    # Momentum override: if price has already moved >3% in last 4h, don't fade it
+    # This week's lesson: composite said LONG during -5% to -7% crashes
+    recent_ret_4h = ohlcv[price_col].pct_change(4).iloc[-1] if len(ohlcv) > 4 else 0
+    if not pd.isna(recent_ret_4h):
+        if recent_ret_4h < -0.03 and prob > 0.5:
+            # Price crashed >3% but model says LONG — override to neutral
+            prob = 0.5
+            expected_move = 0
+            session_warning = " (MOMENTUM OVERRIDE: price dropped >3% in 4h — do not fade)"
+        elif recent_ret_4h > 0.03 and prob < 0.5:
+            # Price rallied >3% but model says SHORT — override to neutral
+            prob = 0.5
+            expected_move = 0
+            session_warning = " (MOMENTUM OVERRIDE: price rallied >3% in 4h — do not fade)"
+
+    # ── Bybit-calibrated thresholds ───────────────────────────────────────────
+    # Bybit fixed funding floor = +0.50%/8h = +1.50%/day = +0.25%/4h carry
+    # Round-trip slippage est = 0.20% → total 4h hurdle = 0.45%
+    # Backtested sweet spot: model prob ≥ 55% = win rate 71%, Sharpe 8.19
+    # Real break-even probability = 61% (when carry adjusted out)
+    BYBIT_ENTRY_THRESHOLD = 0.55   # minimum for a trade entry signal
+    BYBIT_BREAK_EVEN      = 0.61   # carry-adjusted break-even probability
+    above_bybit_threshold = prob >= BYBIT_ENTRY_THRESHOLD
+
+    # Conviction label — Bybit-aware
+    if prob >= BYBIT_BREAK_EVEN:
+        conviction = "HIGH"            # >61% — genuinely above carry cost
+    elif prob >= BYBIT_ENTRY_THRESHOLD:
+        conviction = "MODERATE"        # 55-61% — above entry threshold, below break-even
+    elif prob <= (1 - BYBIT_BREAK_EVEN):   # ≤39%
         conviction = "HIGH (bearish)"
-    elif prob < 0.45:
+    elif prob <= (1 - BYBIT_ENTRY_THRESHOLD):   # ≤45%
         conviction = "MODERATE (bearish)"
     else:
-        conviction = "LOW"
+        conviction = "LOW"             # 45-55% — no edge after carry
+
+    # Entry recommendation
+    if prob >= BYBIT_ENTRY_THRESHOLD:
+        entry_rec = "ENTER LONG ✅"
+    elif prob <= (1 - BYBIT_ENTRY_THRESHOLD):
+        entry_rec = "ENTER SHORT / REDUCE ⚠️"
+    else:
+        entry_rec = "NO TRADE — below threshold 🚫"
+
+    n_features = X.shape[1] if "X" in dir() else len(x_now.ravel())
 
     result.update({
         "prob_positive_4h": round(prob, 4),
         "expected_move_pct": round(expected_move, 2),
         "model_n_train": len(df),
         "conviction": conviction,
+        "entry_recommendation": entry_rec,
+        "above_bybit_threshold": above_bybit_threshold,
+        "bybit_entry_threshold": BYBIT_ENTRY_THRESHOLD,
+        "bybit_break_even": BYBIT_BREAK_EVEN,
+        "bybit_carry_4h_pct": round(BYBIT_COST_4H * 100, 3),
         "description": (
-            f"{prob:.0%} probability of positive 4h return. "
-            f"Expected move: {expected_move:+.2f}%. "
+            f"{prob:.0%} prob of +4h return. Expected move: {expected_move:+.2f}%. "
             f"Conviction: {conviction}. "
-            f"(Model: {X.shape[1]} features, {len(df)} obs)"
+            f"Bybit threshold: {BYBIT_ENTRY_THRESHOLD:.0%} | break-even: {BYBIT_BREAK_EVEN:.0%} | "
+            f"carry cost: {BYBIT_COST_4H*100:.2f}%/4h. "
+            f"{entry_rec}. "
+            f"(Model: {model_label}, {n_features} features, {len(df)} obs)"
             f"{session_warning}"
         ),
     })
@@ -331,16 +498,36 @@ def _project_mean_reversion(data, state):
                 break
 
         # Extremity assessment
-        if percentile > 0.90:
+        # Live calibration (Apr 2026): p84 confirmed 8h mean reversion at 93% hit rate.
+        # Thresholds lowered from p90/p10 to p80/p20 to catch extremes earlier.
+        if percentile > 0.85:
             extremity = f"EXTREME LONG bias (top {(1-percentile)*100:.0f}% of history)"
+            lsr_action = (
+                f"⚠ FORCED UNWIND SIGNAL — LSR at {percentile:.0%} percentile. "
+                f"Historically, longs liquidate back to median within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} hit rate). This is a structural SHORT SETUP."
+            )
         elif percentile > 0.75:
             extremity = f"High long bias ({percentile:.0%} percentile)"
-        elif percentile < 0.10:
+            lsr_action = (
+                f"Elevated long crowding. Reversion risk within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} hit rate). Avoid new longs, consider reducing."
+            )
+        elif percentile < 0.15:
             extremity = f"EXTREME SHORT bias (bottom {percentile*100:.0f}% of history)"
+            lsr_action = (
+                f"⚠ FORCED SHORT COVER — LSR at {percentile:.0%} percentile. "
+                f"Short squeeze risk within ~{avg_revert_time:.0f}h ({revert_rate:.0%} hit rate)."
+            )
         elif percentile < 0.25:
             extremity = f"High short bias ({percentile:.0%} percentile)"
+            lsr_action = (
+                f"Elevated short crowding. Squeeze risk within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} hit rate). Avoid new shorts."
+            )
         else:
             extremity = f"Normal range ({percentile:.0%} percentile)"
+            lsr_action = ""
 
         result["lsr"] = {
             "current": round(current_lsr, 4),
@@ -350,12 +537,14 @@ def _project_mean_reversion(data, state):
             "revert_rate": round(revert_rate, 2),
             "projected_cross_time_h": cross_time,
             "projected_path": [round(v, 4) for v in path],
+            "lsr_action": lsr_action,
             "description": (
                 f"LSR: {current_lsr:.4f} — {extremity}. "
                 f"Median: {median_lsr:.4f}. "
                 f"Avg reversion time from extremes: {avg_revert_time:.0f}h "
                 f"(revert rate: {revert_rate:.0%}). "
                 f"{'Projected to cross equilibrium in ' + str(cross_time) + 'h.' if cross_time else 'Near equilibrium.'}"
+                + (f" {lsr_action}" if lsr_action else "")
             ),
         }
 
@@ -409,20 +598,23 @@ def _detect_hourly_manipulation_cycle(data, state):
     if signals is not None and "sig_oi_accel" in signals.columns:
         oi_accel_sig = signals["sig_oi_accel"].iloc[-1] if len(signals) > 0 else 0
 
-    # Phase: SPIKE_IN_PROGRESS
+    # Phase: SPIKE_IN_PROGRESS — this is an EXIT signal, not entry
+    # Backtest: SPIKE events averaged -5.32% this week (0% hit rate)
+    # The manufactured move is ENDING — distribution is happening
     if last_vol_ratio > 1.5 and abs(last_oi_4h_change) > 0.05:
-        # Count hours in spike
         hours_in = sum(1 for v in recent_vol_ratios.values[-6:] if v > 1.3)
         result = {
             "phase": "SPIKE_IN_PROGRESS",
             "description": (
-                f"Manufactured move underway. Volume {last_vol_ratio:.1f}x normal, "
+                f"EXIT SIGNAL — Spike phase detected. Volume {last_vol_ratio:.1f}x normal, "
                 f"OI changed {last_oi_4h_change:+.1%} in 4h. "
-                f"This is the liquidation/squeeze phase."
+                f"This is distribution/exhaustion — the move is ending, not starting. "
+                f"Close positions or tighten stops. Do NOT enter new trades."
             ),
             "hours_in_phase": hours_in,
             "est_hours_to_move": 0,
             "confidence": 0.85,
+            "action": "EXIT",
         }
 
     # Phase: BUILDUP
@@ -469,6 +661,14 @@ def _project_session_conditional(data, state):
     direction = "LONG" if state.get("composite", 0) > 0 else "SHORT"
     hour = state.get("utc_hour", 12)
 
+    # Day-of-week — always compute so it's available even on early return
+    import datetime as _dt_sc
+    _dow_now = _dt_sc.datetime.utcnow().weekday()
+    _DOW_NAMES = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+                  4: "Friday", 5: "Saturday", 6: "Sunday"}
+    _day_name = _DOW_NAMES.get(_dow_now, "")
+    _day_bias = "bearish" if _dow_now in (3, 4) else ("bullish" if _dow_now == 0 else "neutral")
+
     result = {
         "session": session,
         "direction": direction,
@@ -476,6 +676,8 @@ def _project_session_conditional(data, state):
         "session_bias_4h_bps": 0.0,
         "combined_edge_pct": 0.0,
         "n_samples": 0,
+        "day_of_week": _day_name,
+        "day_bias": _day_bias,
         "description": "Insufficient data.",
     }
 
@@ -516,25 +718,51 @@ def _project_session_conditional(data, state):
 
     combined_edge = cond_avg + (bias_sum / 100)  # convert bps to pct
 
+    # Volume context: thin market reduces signal quality and widens slippage
+    # Live calibration: -37% volume confirmed wider spreads and less reliable signals
+    vol_warning = ""
+    volume_pct_of_avg = 1.0
+    if ohlcv is not None and "volume" in ohlcv.columns and len(ohlcv) >= 24:
+        try:
+            _vol24_avg = ohlcv["volume"].iloc[-24:].mean()
+            _vol_cur = ohlcv["volume"].iloc[-1]
+            if _vol24_avg > 0:
+                volume_pct_of_avg = float(_vol_cur / _vol24_avg)
+                if volume_pct_of_avg < 0.50:
+                    vol_warning = f" ⚠ VERY THIN VOLUME ({volume_pct_of_avg:.0%} of 24h avg) — reduce position size 40%+, expect wide spreads."
+                elif volume_pct_of_avg < 0.70:
+                    vol_warning = f" ⚠ THIN VOLUME ({volume_pct_of_avg:.0%} of 24h avg) — reduce position size 25-30%."
+        except Exception:
+            pass
+
     # Session-direction quality assessment from backtest evidence
     quality = "NEUTRAL"
     warning = ""
 
-    # Backtest-confirmed edge rankings:
-    # Best:  Late NYC SHORT +1.07% (69% hit), Asia SHORT +0.35%, NYC LONG +0.40%
-    # Worst: London LONG -0.35% (41% hit)
-    if session == "London" and direction == "LONG":
-        quality = "AVOID"
-        warning = " London LONG has confirmed NEGATIVE edge (-0.35% avg, 41% hit rate)."
-    elif session == "Late NYC" and direction == "SHORT":
+    # Quality based on this observation's edge strength, not hard-coded session labels
+    # (hard-coded labels were overfit — inverted in live trading)
+    warning = ""
+    if combined_edge > 0.3 and n >= 30:
         quality = "STRONG"
-        warning = " Late NYC SHORT is the highest-edge combo (+1.07% avg, 69% hit rate)."
-    elif session == "Asia" and direction == "SHORT":
+    elif combined_edge > 0.1:
         quality = "FAVORABLE"
-        warning = " Asia SHORT has positive edge (+0.35% avg, confirmed by backtest)."
-    elif session == "NYC" and direction == "LONG":
+    elif combined_edge < -0.2:
+        quality = "WEAK"
+    else:
+        quality = "NEUTRAL"
+
+    # Downgrade quality one tier when volume is thin (signals are noisier)
+    if volume_pct_of_avg < 0.70 and quality == "STRONG":
         quality = "FAVORABLE"
-        warning = " NYC LONG has positive edge (+0.40% avg)."
+    elif volume_pct_of_avg < 0.70 and quality == "FAVORABLE":
+        quality = "NEUTRAL"
+
+    # Day-of-week note for description
+    day_note = ""
+    if _dow_now in (3, 4):
+        day_note = f" ⚠ {_day_name} has bearish bias historically."
+    elif _dow_now == 0:
+        day_note = f" {_day_name} has bullish bias historically."
 
     result.update({
         "conditional_avg_return_pct": round(cond_avg, 3),
@@ -542,11 +770,14 @@ def _project_session_conditional(data, state):
         "combined_edge_pct": round(combined_edge, 3),
         "n_samples": n,
         "quality": quality,
+        "volume_pct_of_avg": round(volume_pct_of_avg, 2),
+        "day_of_week": _day_name,
+        "day_bias": _day_bias,
         "description": (
             f"{direction} during {session}: avg 4h return {cond_avg:+.2f}% "
             f"(n={n}). Session bias next 4h: {bias_sum:+.0f} bps. "
             f"Combined edge: {combined_edge:+.2f}%. "
-            f"Quality: {quality}.{warning}"
+            f"Quality: {quality}.{day_note}{warning}{vol_warning}"
         ),
     })
     return result
@@ -697,11 +928,28 @@ def _compute_confidence_intervals(data, state, prob_result):
     if np.isnan(hourly_vol) or hourly_vol == 0:
         hourly_vol = 0.02  # fallback 2% hourly vol
 
+    # Volume adjustment: thin markets → widen bands (lower reliability)
+    # Live calibration: -37% volume = bands widened 20%, center less reliable
+    vol_24h_avg = ohlcv["volume"].iloc[-24:].mean() if "volume" in ohlcv.columns and len(ohlcv) >= 24 else None
+    vol_current = ohlcv["volume"].iloc[-1] if "volume" in ohlcv.columns and len(ohlcv) > 0 else None
+    volume_ratio = 1.0
+    thin_volume = False
+    if vol_24h_avg is not None and vol_current is not None and vol_24h_avg > 0:
+        volume_ratio = float(vol_current / vol_24h_avg)
+        thin_volume = volume_ratio < 0.65  # <65% of 24h avg = thin
+
+    # When volume is thin: widen confidence bands (market more erratic)
+    vol_expansion = 1.0
+    if volume_ratio < 0.65:
+        vol_expansion = 1.25   # 25% wider bands
+    elif volume_ratio < 0.80:
+        vol_expansion = 1.12   # 12% wider
+
     # Point estimate direction from probability model
     expected_move_pct = prob_result.get("expected_move_pct", 0) / 100
 
     for horizon, label in [(4, "h4"), (8, "h8")]:
-        vol_h = hourly_vol * np.sqrt(horizon)
+        vol_h = hourly_vol * np.sqrt(horizon) * vol_expansion
         center = current_price * (1 + expected_move_pct * (horizon / 4))
 
         result[label] = {
@@ -709,6 +957,8 @@ def _compute_confidence_intervals(data, state, prob_result):
             "center": round(center, 6),
             "current_price": round(current_price, 6),
             "vol_pct": round(vol_h * 100, 2),
+            "volume_ratio": round(volume_ratio, 2),
+            "thin_volume": thin_volume,
             "low_68": round(center * (1 - vol_h), 6),
             "high_68": round(center * (1 + vol_h), 6),
             "low_95": round(center * (1 - 2 * vol_h), 6),
@@ -1017,15 +1267,25 @@ def _project_cross_exchange_derivatives(data, market_state):
         current_funding = market_state.get("avg_funding", 0)
         funding_shift = mean_pred - current_funding
 
-        if abs(mean_pred) > 0.0005:
+        # Bybit FARTCOIN has a fixed funding floor of +0.5% per 8h.
+        # Thresholds must be calibrated above that floor to be meaningful.
+        # MODERATE = above floor, HIGH = genuinely extreme for Bybit perps.
+        BYBIT_FUNDING_FLOOR = 0.005   # 0.5% — Bybit minimum for FARTCOIN
+        SQUEEZE_HIGH_THRESHOLD = 0.008   # >0.8% is truly elevated above floor
+        SQUEEZE_MOD_THRESHOLD  = 0.006   # >0.6% is modestly elevated
+
+        if abs(mean_pred) > BYBIT_FUNDING_FLOOR * 0.5:
             direction = "longs will pay" if mean_pred > 0 else "shorts will pay"
             result["predicted_funding_desc"] = (
                 f"Predicted funding: {mean_pred:.4%} ({direction}). "
-                f"Shift from current: {funding_shift:+.4%}.")
-            if abs(mean_pred) > 0.001:
+                f"Shift from current: {funding_shift:+.4%}. "
+                f"[Bybit floor: +0.50% — readings at floor are not signals]")
+            if abs(mean_pred) > SQUEEZE_HIGH_THRESHOLD:
                 result["squeeze_risk"] = "HIGH"
-            else:
+            elif abs(mean_pred) > SQUEEZE_MOD_THRESHOLD:
                 result["squeeze_risk"] = "MODERATE"
+            else:
+                result["squeeze_risk"] = "LOW"   # at/near floor — not a signal
         else:
             result["predicted_funding_desc"] = "Predicted funding near zero — balanced market."
             result["squeeze_risk"] = "LOW"
@@ -1093,7 +1353,950 @@ def _project_cross_exchange_derivatives(data, market_state):
 
 
 # =========================================================================
+# 10. Coinglass OI Momentum + Funding Spread
+# =========================================================================
+
+def _project_coinglass_oi_funding(data, state):
+    """
+    Derive signals from Coinglass real-time OI momentum and cross-exchange
+    funding spread.
+
+    BACKTEST-CALIBRATED SIGNAL INTERPRETATIONS (90 days, 2128 obs):
+      - OI spike (>2% in 1h): historically BEARISH (-0.12% to -0.25% avg 4h, 44-47% hit)
+        → Not a trend-follow signal. High OI growth = crowded setup prone to reversal.
+      - OI flat + price falling: BEST BUY signal (+0.96% avg 4h, 70% hit)
+        → Spot-driven drop with no new leveraged shorts = temporary dislocation
+      - OI rising quietly (PASSIVE_ACCUM): mildly bullish (+0.36%, 55% hit)
+        → Steady accumulation without price chasing is the healthy version
+      - OI + price both surging (TREND_CHASE): bearish (-0.25%, 44% hit)
+        → Crowded, exhaustion risk
+      - Funding extreme short (<p5=-0.87%): contrarian long (+0.72%, 58% hit)
+      - Funding extreme long (>p95=+0.86%): contrarian short (-0.51%, 47% hit)
+      - Funding spread > 1% across exchanges → arb/manipulation risk
+      - Settlement within 30min → price pinning or spike risk
+    """
+    result = {
+        "available": False,
+        "assessment": "NO_DATA",
+        "description": "Coinglass data not available.",
+    }
+
+    cg_oi = data.get("coinglass_oi")
+    cg_fund = data.get("coinglass_funding")
+
+    if (cg_oi is None or cg_oi.empty) and (cg_fund is None or cg_fund.empty):
+        return result
+
+    parts = []
+    oi_assessment = "NORMAL"
+    fund_assessment = "NORMAL"
+
+    # --- OI Momentum ---
+    if cg_oi is not None and not cg_oi.empty:
+        latest_oi = cg_oi.iloc[-1]
+
+        oi_usd       = float(latest_oi.get("oi_usd", 0))
+        m5_oi        = float(latest_oi.get("m5_oi_chg", 0))
+        m15_oi       = float(latest_oi.get("m15_oi_chg", 0))
+        h1_oi        = float(latest_oi.get("h1_oi_chg", 0))
+        h4_oi        = float(latest_oi.get("h4_oi_chg", 0))
+        oi_vol_ratio = float(latest_oi.get("oi_vol_ratio", 0))
+        oi_spike     = str(latest_oi.get("oi_spike", "NORMAL"))
+        oi_div       = str(latest_oi.get("oi_vol_divergence", "NORMAL"))
+        leverage_flag = str(latest_oi.get("leverage_flag", "NORMAL"))
+        oi_direction  = str(latest_oi.get("direction_flag", "NEUTRAL"))
+        avg_funding   = float(latest_oi.get("avg_funding", 0)) * 100  # to pct
+
+        # --- OI/Price Divergence: best signal from backtest ---
+        # Requires current price data to compare OI vs price direction
+        ohlcv = data.get("ohlcv")
+        price_col = "price" if ohlcv is not None and "price" in ohlcv.columns else "close"
+        price_1h_chg = 0.0
+        if ohlcv is not None and len(ohlcv) > 1:
+            try:
+                price_1h_chg = float(ohlcv[price_col].pct_change(1).iloc[-1] * 100)
+            except Exception:
+                price_1h_chg = 0.0
+
+        # Also compute 4h price change for divergence detection
+        price_4h_chg = 0.0
+        if ohlcv is not None and len(ohlcv) > 4:
+            try:
+                price_4h_chg = float(ohlcv[price_col].pct_change(4).iloc[-1] * 100)
+            except Exception:
+                price_4h_chg = 0.0
+
+        oi_price_divergence = "NORMAL"
+        if abs(h1_oi) < 0.5 and price_1h_chg < -1.0:
+            # BEST BUY: OI flat + price falling → spot-driven dip, not leveraged selling
+            # Historically: +0.96% avg 4h, 70% hit rate
+            oi_price_divergence = "SPOT_DIP_BUY"
+            oi_assessment = "OI_PRICE_DIV_LONG"
+            parts.append(
+                f"⭐ OI flat ({h1_oi:+.1f}%/1h) + price down {price_1h_chg:+.1f}% "
+                f"→ SPOT DIP (historically +0.96% avg 4h, 70% hit rate)"
+            )
+        elif h4_oi > 3.0 and price_4h_chg < -0.5:
+            # NEW (calibrated Apr 2026): OI building over 4h while price declining.
+            # Longs are adding into a falling price — classic exhaustion/distribution fingerprint.
+            # Not quite TREND_CHASE (price isn't surging), but worse — longs being trapped.
+            # Historical edge: -0.25% avg 4h, 44% hit (similar to trend-chase, structural weakness)
+            oi_price_divergence = "OI_BUILDING_PRICE_WEAK"
+            oi_assessment = "OI_BUILDING_PRICE_WEAK"
+            parts.append(
+                f"🔴 OI building +{h4_oi:.1f}%/4h while price {price_4h_chg:+.1f}% — "
+                f"longs adding into weakness (exhaustion fingerprint, historically -0.25% avg 4h, 44% hit)"
+            )
+        elif h1_oi > 2.0 and abs(price_1h_chg) < 0.5:
+            # PASSIVE ACCUM: OI building quietly, price not reacting yet
+            # Historically: +0.36% avg 4h, 55% hit rate
+            oi_price_divergence = "PASSIVE_ACCUM"
+            oi_assessment = "PASSIVE_ACCUM"
+            parts.append(
+                f"OI rising {h1_oi:+.1f}%/1h quietly — passive accumulation "
+                f"(historically +0.36% avg 4h, 55% hit)"
+            )
+        elif h1_oi > 2.0 and price_1h_chg > 0.5:
+            # TREND CHASE: both OI and price rising fast — exhaustion risk
+            # Historically: -0.25% avg 4h, 44% hit
+            oi_price_divergence = "TREND_CHASE"
+            oi_assessment = "OI_TREND_CHASE_BEARISH"
+            parts.append(
+                f"⚠ OI {h1_oi:+.1f}%/1h + price {price_1h_chg:+.1f}% — trend chase "
+                f"(historically -0.25% avg 4h, 44% hit — exhaustion risk)"
+            )
+        elif oi_spike in ("SPIKE_5M", "SPIKE_15M"):
+            # OI SPIKE without price context: historically bearish (-0.12% to -0.14%, 46-47% hit)
+            oi_assessment = "OI_SPIKE_CAUTION"
+            parts.append(
+                f"⚠ OI spike: {m5_oi:+.1f}% in 5m / {m15_oi:+.1f}% in 15m "
+                f"— historically bearish (-0.14% avg 4h, 46% hit)"
+            )
+        elif oi_spike == "SURGE_1H" or abs(h1_oi) > 5:
+            # Rapid OI surge: also historically a fade signal
+            oi_assessment = "OI_SURGE_CAUTION"
+            parts.append(
+                f"⚠ OI surge {h1_oi:+.1f}%/1h — rapid leverage buildup "
+                f"(historically bearish, 44-47% hit)"
+            )
+        elif abs(h4_oi) > 5:
+            oi_assessment = "OI_BUILDING"
+            parts.append(f"OI building {h4_oi:+.1f}% over 4h (monitor for reversal)")
+
+        result["oi_price_divergence"] = oi_price_divergence
+        result["price_1h_chg"] = round(price_1h_chg, 3)
+
+        if oi_div == "DELEVERAGE":
+            parts.append("OI dropping + volume spike (forced unwind — potential volatility)")
+
+        if leverage_flag == "HIGH":
+            parts.append(f"OI/Vol ratio {oi_vol_ratio:.2f} — highly leveraged (fragile)")
+        elif leverage_flag == "ELEVATED":
+            parts.append(f"OI/Vol ratio {oi_vol_ratio:.2f} — elevated leverage")
+
+        result["oi_usd"] = round(oi_usd / 1e6, 1)
+        result["m5_oi_chg"] = m5_oi
+        result["m15_oi_chg"] = m15_oi
+        result["h1_oi_chg"] = h1_oi
+        result["h4_oi_chg"] = h4_oi
+        result["oi_vol_ratio"] = oi_vol_ratio
+        result["oi_direction"] = oi_direction
+        result["oi_assessment"] = oi_assessment
+        result["avg_funding_pct"] = round(avg_funding, 4)
+
+    # --- Funding Spread ---
+    if cg_fund is not None and not cg_fund.empty:
+        latest_f = cg_fund.iloc[-1]
+
+        mean_rate       = float(latest_f.get("mean_rate_pct", 0))
+        max_rate        = float(latest_f.get("max_rate_pct", 0))
+        min_rate        = float(latest_f.get("min_rate_pct", 0))
+        spread          = float(latest_f.get("spread_pct", 0))
+        mean_predicted  = float(latest_f.get("mean_predicted_pct", 0))
+        pred_delta      = float(latest_f.get("pred_vs_current_delta", 0))
+        mins_to_settle  = float(latest_f.get("min_mins_to_settle", 999))
+        fund_extreme    = str(latest_f.get("funding_extreme", "NORMAL"))
+        fund_divergence = str(latest_f.get("funding_divergence", "NORMAL"))
+        predicted_shift = str(latest_f.get("predicted_shift", "STABLE"))
+        settlement_imm  = bool(latest_f.get("settlement_imminent", False))
+
+        binance_rate   = float(latest_f.get("binance_rate", 0))
+        bybit_rate     = float(latest_f.get("bybit_rate", 0))
+        okx_rate       = float(latest_f.get("okx_rate", 0))
+        hl_rate        = float(latest_f.get("hyperliquid_rate", 0))
+
+        if fund_extreme in ("EXTREME_LONG", "HIGH_LONG"):
+            fund_assessment = fund_extreme
+            parts.append(
+                f"Funding extreme: mean {mean_rate:+.3f}% "
+                f"(Binance {binance_rate:+.3f}% / Bybit {bybit_rate:+.3f}% / OKX {okx_rate:+.3f}%)"
+            )
+        elif fund_extreme == "EXTREME_SHORT":
+            # Only flag as actionable if a primary traded exchange (Bybit/Binance/OKX) is negative.
+            # The min_rate can be dragged down by obscure venues not relevant to our execution.
+            _primary_negative = bybit_rate < -0.1 or binance_rate < -0.1 or okx_rate < -0.1
+            if _primary_negative:
+                fund_assessment = "EXTREME_SHORT"
+                _neg_exchanges = ", ".join(
+                    e for e, r in [("Bybit", bybit_rate), ("Binance", binance_rate), ("OKX", okx_rate)]
+                    if r < -0.1
+                )
+                parts.append(
+                    f"Funding negative on primary exchange(s): {_neg_exchanges} "
+                    f"(mean {mean_rate:+.3f}%) — shorts crowded, contrarian long signal"
+                )
+            else:
+                # Negative rate is on a minor venue only — not actionable for Bybit traders
+                parts.append(
+                    f"Funding spread: min {min_rate:+.3f}% (minor venue) vs "
+                    f"Bybit {bybit_rate:+.3f}% / Binance {binance_rate:+.3f}% — "
+                    f"cross-exchange arb only, not a primary market signal"
+                )
+                fund_assessment = "FUNDING_SPREAD"
+
+        if fund_divergence in ("HIGH_SPREAD", "ELEVATED_SPREAD"):
+            parts.append(
+                f"Cross-exchange spread {spread:.3f}% "
+                f"(max: {max_rate:+.3f}% / min: {min_rate:+.3f}%) — arb/manipulation risk"
+            )
+            if fund_assessment == "NORMAL":
+                fund_assessment = "FUNDING_SPREAD"
+
+        if predicted_shift == "RATE_RISING":
+            parts.append(f"Predicted funding rising to {mean_predicted:+.3f}% (Δ{pred_delta:+.3f}%)")
+        elif predicted_shift == "RATE_FALLING":
+            parts.append(f"Predicted funding falling to {mean_predicted:+.3f}% (Δ{pred_delta:+.3f}%)")
+
+        if settlement_imm:
+            parts.append(f"⚡ Settlement in {mins_to_settle:.0f}min — price pin or spike risk")
+            if fund_assessment == "NORMAL":
+                fund_assessment = "SETTLEMENT_IMMINENT"
+
+        result["mean_rate_pct"]      = mean_rate
+        result["spread_pct"]         = spread
+        result["mean_predicted_pct"] = mean_predicted
+        result["pred_delta"]         = pred_delta
+        result["mins_to_settle"]     = mins_to_settle
+        result["settlement_imminent"] = settlement_imm
+        result["fund_assessment"]    = fund_assessment
+        result["predicted_shift"]    = predicted_shift
+        result["bybit_rate"]         = bybit_rate
+        result["binance_rate"]       = binance_rate
+
+        # --- Bybit carry cost context ---
+        # Bybit FARTCOIN fixed floor = +0.5%/8h = 1.5%/day = 10.5%/week
+        # Any long must overcome this carry to be profitable
+        bybit_daily_carry = bybit_rate * 3   # 3 settlements per day
+        result["bybit_daily_carry_pct"] = round(bybit_daily_carry, 4)
+        if bybit_rate >= 0.005:
+            parts.append(
+                f"⚠ Bybit carry: {bybit_rate:+.3f}%/8h = {bybit_daily_carry:+.2f}%/day "
+                f"({bybit_daily_carry * 7:+.1f}%/wk) — longs need >{bybit_daily_carry:.2f}%/day to profit"
+            )
+
+        # --- Binance/Bybit divergence signal (NEW) ---
+        # When Binance funding diverges significantly from Bybit's floor:
+        #   Binance << Bybit floor → Binance traders are bearish (informed flow)
+        #   Binance >> Bybit floor → Binance traders are very long (crowded)
+        binance_vs_bybit = binance_rate - bybit_rate
+        result["binance_vs_bybit_spread"] = round(binance_vs_bybit, 4)
+
+        BYBIT_FLOOR = 0.5   # pct
+        if binance_rate < (BYBIT_FLOOR - 0.3):
+            # Binance is materially below Bybit floor — informed money is bearish
+            divergence_signal = "BINANCE_BEARISH_VS_BYBIT"
+            parts.append(
+                f"⚠ Binance/Bybit divergence: Binance {binance_rate:+.3f}% vs Bybit {bybit_rate:+.3f}% "
+                f"(Δ{binance_vs_bybit:+.3f}%) — informed market is bearish vs Bybit longs"
+            )
+            result["binance_bybit_divergence"] = divergence_signal
+        elif binance_rate > (BYBIT_FLOOR + 0.5):
+            # Binance is materially above Bybit floor — both crowded long
+            divergence_signal = "BOTH_CROWDED_LONG"
+            parts.append(
+                f"Both Binance ({binance_rate:+.3f}%) and Bybit ({bybit_rate:+.3f}%) elevated "
+                f"— market-wide long crowding, reversal risk"
+            )
+            result["binance_bybit_divergence"] = divergence_signal
+        else:
+            result["binance_bybit_divergence"] = "NORMAL"
+
+    # Overall assessment (priority: actionable signals first)
+    # Pull Binance/Bybit divergence if computed
+    _bb_div = result.get("binance_bybit_divergence", "NORMAL")
+
+    # Positive signals
+    if oi_assessment == "OI_PRICE_DIV_LONG":
+        overall = "OI_PRICE_DIV_LONG"          # best buy signal (70% hit)
+    elif oi_assessment == "PASSIVE_ACCUM":
+        overall = "PASSIVE_ACCUM"               # steady accumulation (55% hit)
+    elif fund_assessment == "EXTREME_SHORT":
+        overall = "EXTREME_SHORT_FUNDING"       # contrarian long — primary exchange confirmed
+    # Negative / caution signals
+    elif _bb_div == "BINANCE_BEARISH_VS_BYBIT":
+        overall = "BINANCE_BEARISH_VS_BYBIT"    # informed money vs Bybit longs — bearish edge
+    elif oi_assessment in ("OI_SPIKE_CAUTION", "OI_SURGE_CAUTION", "OI_TREND_CHASE_BEARISH"):
+        overall = oi_assessment
+    elif fund_assessment in ("EXTREME_LONG", "HIGH_LONG") or _bb_div == "BOTH_CROWDED_LONG":
+        overall = fund_assessment if fund_assessment in ("EXTREME_LONG", "HIGH_LONG") \
+                  else "BOTH_CROWDED_LONG"      # contrarian bearish
+    # Structural alerts
+    elif fund_assessment == "SETTLEMENT_IMMINENT":
+        overall = "SETTLEMENT_IMMINENT"
+    elif oi_assessment == "OI_BUILDING":
+        overall = "OI_BUILDING"
+    elif fund_assessment == "FUNDING_SPREAD":
+        overall = "FUNDING_SPREAD"
+    else:
+        overall = "NORMAL"
+
+    description = " | ".join(parts) if parts else "OI and funding within normal ranges."
+
+    result.update({
+        "available": True,
+        "assessment": overall,
+        "description": description,
+    })
+    return result
+
+
+# =========================================================================
+# Model 11: Funding Settlement Cycle Analyzer
+# =========================================================================
+
+def _project_funding_settlement_cycle(data, state):
+    """
+    Analyze funding settlement patterns at 00:00, 08:00, 16:00 UTC.
+
+    Key structural behavior:
+    - Positive funding + pre-settlement: longs close to avoid paying → price dips
+    - Positive funding + post-settlement: pressure releases → bounce likely
+    - Negative funding + pre-settlement: shorts close to avoid paying → price spikes
+    - Negative funding + post-settlement: pressure releases → pullback likely
+
+    Uses historical OHLCV to compute mean pre/post returns by funding sign.
+    """
+    import datetime as _dt
+
+    SETTLEMENT_HOURS = [0, 8, 16]
+    PRE_WINDOW = 1   # candles before settlement (1h resolution = 1 candle = 1h before)
+    POST_WINDOW = 2  # candles after settlement to check effect
+
+    result = {
+        "mins_to_settlement": None,
+        "next_settlement_utc": None,
+        "phase": "MID_CYCLE",
+        "current_funding_sign": "NEUTRAL",
+        "pre_ret_mean": None,
+        "post_ret_mean": None,
+        "historical_n": 0,
+        "expected_effect": "UNKNOWN",
+        "confidence": 0.0,
+        "description": "Insufficient data for settlement cycle analysis.",
+    }
+
+    ohlcv = data.get("ohlcv")
+    funding_df = data.get("funding")
+
+    if ohlcv is None or len(ohlcv) < 48:
+        return result
+
+    price_col = "price" if "price" in ohlcv.columns else "close"
+
+    # --- Time to next settlement ---
+    now_utc = _dt.datetime.utcnow()
+    current_hour = now_utc.hour
+    current_min = now_utc.minute
+
+    # Find next settlement hour
+    upcoming = [h for h in SETTLEMENT_HOURS if h > current_hour]
+    next_settle_h = upcoming[0] if upcoming else SETTLEMENT_HOURS[0] + 24
+    today = now_utc.replace(minute=0, second=0, microsecond=0)
+    if upcoming:
+        next_settle_dt = today.replace(hour=next_settle_h)
+    else:
+        next_settle_dt = (today + _dt.timedelta(days=1)).replace(hour=SETTLEMENT_HOURS[0])
+
+    mins_to_settle = (next_settle_dt - now_utc).total_seconds() / 60
+    result["mins_to_settlement"] = round(mins_to_settle, 0)
+    result["next_settlement_utc"] = next_settle_dt.strftime("%H:%M UTC")
+
+    # Phase classification
+    if mins_to_settle <= 30:
+        phase = "PRE_SETTLEMENT"
+    elif mins_to_settle >= (8 * 60 - 60):
+        phase = "JUST_SETTLED"
+    else:
+        phase = "MID_CYCLE"
+    result["phase"] = phase
+
+    # --- Current funding sign ---
+    avg_funding = state.get("avg_funding", 0)
+    if avg_funding > 0.0001:
+        funding_sign = "POSITIVE"
+    elif avg_funding < -0.0001:
+        funding_sign = "NEGATIVE"
+    else:
+        funding_sign = "NEUTRAL"
+    result["current_funding_sign"] = funding_sign
+
+    # --- Historical analysis: compute pre/post returns at each settlement ---
+    if not hasattr(ohlcv.index, "hour"):
+        return result
+
+    prices = ohlcv[price_col].dropna()
+    if len(prices) < 48:
+        return result
+
+    pre_rets_pos, post_rets_pos = [], []   # when funding was positive at settlement
+    pre_rets_neg, post_rets_neg = [], []   # when funding was negative at settlement
+
+    # Get funding series for historical sign classification
+    fund_series = None
+    if funding_df is not None and not funding_df.empty:
+        fund_col = funding_df.columns[0]
+        fund_series = funding_df[fund_col]
+
+    price_idx = prices.index
+    for i in range(PRE_WINDOW, len(prices) - POST_WINDOW):
+        ts = price_idx[i]
+        if not hasattr(ts, 'hour'):
+            continue
+        if ts.hour not in SETTLEMENT_HOURS:
+            continue
+
+        pre_ret = (prices.iloc[i] - prices.iloc[i - PRE_WINDOW]) / prices.iloc[i - PRE_WINDOW]
+        post_ret = (prices.iloc[i + POST_WINDOW] - prices.iloc[i]) / prices.iloc[i]
+
+        # Get funding sign at this settlement (use nearest value)
+        if fund_series is not None and len(fund_series) > 0:
+            try:
+                nearest_fund = fund_series.asof(ts) if hasattr(fund_series.index, 'freq') else \
+                               fund_series.iloc[fund_series.index.searchsorted(ts, side="right") - 1]
+                f_sign = "POSITIVE" if float(nearest_fund) > 0 else "NEGATIVE"
+            except Exception:
+                f_sign = "POSITIVE" if avg_funding > 0 else "NEGATIVE"
+        else:
+            # Use current funding as proxy for historical (imperfect but usable)
+            f_sign = funding_sign
+
+        if f_sign == "POSITIVE":
+            pre_rets_pos.append(pre_ret)
+            post_rets_pos.append(post_ret)
+        else:
+            pre_rets_neg.append(pre_ret)
+            post_rets_neg.append(post_ret)
+
+    # Select the relevant stats based on current funding sign
+    if funding_sign == "POSITIVE":
+        pre_rets = pre_rets_pos
+        post_rets = post_rets_pos
+    elif funding_sign == "NEGATIVE":
+        pre_rets = pre_rets_neg
+        post_rets = post_rets_neg
+    else:
+        pre_rets = pre_rets_pos + pre_rets_neg
+        post_rets = post_rets_pos + post_rets_neg
+
+    n = len(pre_rets)
+    result["historical_n"] = n
+
+    if n < 5:
+        result["description"] = (
+            f"Settlement in {mins_to_settle:.0f}min ({next_settle_dt.strftime('%H:%M UTC')}). "
+            f"Insufficient settlement history (n={n}) to compute pattern stats."
+        )
+        return result
+
+    pre_mean = float(np.mean(pre_rets) * 100)
+    post_mean = float(np.mean(post_rets) * 100)
+    result["pre_ret_mean"] = round(pre_mean, 3)
+    result["post_ret_mean"] = round(post_mean, 3)
+
+    # Confidence: based on consistency and sample size
+    pre_consistency = (np.array(pre_rets) < 0).mean() if pre_mean < 0 else (np.array(pre_rets) > 0).mean()
+    post_consistency = (np.array(post_rets) > 0).mean() if post_mean > 0 else (np.array(post_rets) < 0).mean()
+    confidence = float(np.mean([pre_consistency, post_consistency]) * min(1.0, n / 20))
+    result["confidence"] = round(confidence, 2)
+
+    # Dubai-time settlement labels (UTC+4)
+    dubai_settle_h = (next_settle_dt.hour + 4) % 24
+    dubai_settle_str = f"{dubai_settle_h:02d}:00 Dubai"
+
+    # Expected effect at current phase
+    trade_setup = None
+    trade_setup_desc = ""
+
+    if phase == "PRE_SETTLEMENT":
+        effect_dir = "DOWN" if pre_mean < 0 else "UP"
+        result["expected_effect"] = f"PRE_{effect_dir}"
+        action_note = (
+            f"Pre-settlement with {funding_sign.lower()} funding: "
+            f"historically {pre_mean:+.2f}% in last hour before settlement "
+            f"({pre_consistency:.0%} consistent, n={n})."
+        )
+        # Trade setup: pre-settlement micro-long (positive funding only)
+        if funding_sign == "POSITIVE" and pre_mean > 0:
+            trade_setup = "PRE_SETTLEMENT_MICRO_LONG"
+            trade_setup_desc = (
+                f"⚡ PRE-SETTLEMENT MICRO-LONG — price historically +{pre_mean:.2f}% "
+                f"in last 60min before {result['next_settlement_utc']} ({dubai_settle_str}). "
+                f"Only valid if model ≥55%. Tight stop — exit AT settlement."
+            )
+        elif funding_sign == "POSITIVE" and pre_mean < 0:
+            trade_setup = "PRE_SETTLEMENT_FADE"
+            trade_setup_desc = (
+                f"PRE-SETTLEMENT FADE — positive funding, price historically {pre_mean:.2f}% "
+                f"into settlement. Longs closing to avoid paying."
+            )
+
+    elif phase == "JUST_SETTLED":
+        effect_dir = "UP" if post_mean > 0 else "DOWN"
+        result["expected_effect"] = f"POST_{effect_dir}"
+        action_note = (
+            f"Just settled with {funding_sign.lower()} funding: "
+            f"historically {post_mean:+.2f}% in 2h after settlement "
+            f"({post_consistency:.0%} consistent, n={n})."
+        )
+        if funding_sign == "POSITIVE" and post_mean < 0:
+            trade_setup = "POST_SETTLEMENT_FADE"
+            trade_setup_desc = (
+                f"⭐ POST-SETTLEMENT FADE — funding just reset. Historically {post_mean:.2f}% "
+                f"in 2h after settlement with positive funding (n={n}). "
+                f"Short on any bounce. Target: -{abs(post_mean):.2f}%."
+            )
+        elif post_mean > 0:
+            trade_setup = "POST_SETTLEMENT_BOUNCE"
+            trade_setup_desc = (
+                f"POST-SETTLEMENT BOUNCE — historically +{post_mean:.2f}% in 2h "
+                f"after settlement (n={n}). Only if model ≥55%."
+            )
+
+    else:
+        result["expected_effect"] = "MID_CYCLE"
+        action_note = (
+            f"Mid-cycle ({mins_to_settle:.0f}min to next settlement). "
+            f"Pre-settlement avg: {pre_mean:+.2f}% | Post-settlement avg: {post_mean:+.2f}%."
+        )
+        # Mid-cycle: flag upcoming setup window (regardless of funding sign)
+        pre_window_mins = max(0, mins_to_settle - 60)
+        if abs(post_mean) > 0.05:
+            post_dir_word = "fade (short)" if post_mean < 0 else "bounce (long)"
+            trade_setup = "UPCOMING_POST_SETTLEMENT_FADE" if post_mean < 0 else "UPCOMING_POST_SETTLEMENT_BOUNCE"
+            trade_setup_desc = (
+                f"📅 UPCOMING SETUP — POST-SETTLEMENT {post_dir_word.upper()} at "
+                f"{result['next_settlement_utc']} ({dubai_settle_str}, in {mins_to_settle:.0f}min). "
+                f"Historically {post_mean:+.2f}% avg in 2h after settlement "
+                f"(n={n}, confidence {confidence:.0%}). "
+                f"Watch for price {'spike into settlement → fade the spike' if post_mean < 0 else 'dip into settlement → buy the dip'}."
+            )
+        if abs(pre_mean) > 0.05 and mins_to_settle <= 90:
+            pre_dir_word = "long" if pre_mean > 0 else "short"
+            trade_setup = f"UPCOMING_PRE_SETTLEMENT_{pre_dir_word.upper()}"
+            trade_setup_desc = (
+                f"⏰ PRE-SETTLEMENT WINDOW OPENING — {mins_to_settle:.0f}min to "
+                f"{result['next_settlement_utc']} ({dubai_settle_str}). "
+                f"Historically {pre_mean:+.2f}% in last 60min before settlement "
+                f"({'only if model ≥55%' if pre_mean > 0 else 'short setup confirmed'})."
+            )
+
+    result["trade_setup"] = trade_setup
+    result["trade_setup_desc"] = trade_setup_desc
+    result["dubai_settlement_time"] = dubai_settle_str
+
+    result["description"] = (
+        f"Settlement cycle: {result['next_settlement_utc']} ({dubai_settle_str}, "
+        f"{mins_to_settle:.0f}min away). "
+        f"Funding: {funding_sign} ({avg_funding:.4f}). "
+        f"{action_note} Confidence: {confidence:.0%}."
+        + (f" {trade_setup_desc}" if trade_setup_desc else "")
+    )
+    return result
+
+
+# =========================================================================
+# Model 12: Liquidation Cascade Detector
+# =========================================================================
+
+def _detect_liquidation_cascade(data, state):
+    """
+    Detect liquidation cascade signatures from OHLCV + liquidation data.
+
+    Cascade fingerprint (OHLCV wick detection):
+    - Lower wick > 2x candle body = forced sellers hit market
+    - Volume spike > 2x 20-period avg = capitulation volume
+    - Recovery: price closes near high of candle body
+
+    Post-cascade entry window (2-4 candles after wick):
+    - Forced sellers exhausted, only organic flow remains
+    - Historically bullish: mean +0.8% to +1.4% over next 4h
+
+    Also checks Coinalyze/Coinglass liquidation z-score if available.
+    """
+    result = {
+        "state": "NORMAL",
+        "cascade_detected": False,
+        "candles_since_cascade": None,
+        "wick_ratio": 0.0,
+        "volume_ratio": 0.0,
+        "liq_zscore": 0.0,
+        "post_cascade_avg_4h": 0.0,
+        "post_cascade_hit_rate": 0.0,
+        "historical_n": 0,
+        "confidence": 0.0,
+        "description": "No liquidation cascade detected.",
+    }
+
+    ohlcv = data.get("ohlcv")
+    if ohlcv is None or len(ohlcv) < 30:
+        return result
+
+    price_col = "price" if "price" in ohlcv.columns else "close"
+    open_col = "open" if "open" in ohlcv.columns else None
+    high_col = "high" if "high" in ohlcv.columns else None
+    low_col = "low" if "low" in ohlcv.columns else None
+    vol_col = "volume" if "volume" in ohlcv.columns else None
+
+    close = ohlcv[price_col].values
+    has_ohlc = all(c in ohlcv.columns for c in ["open", "high", "low"])
+    has_vol = vol_col in ohlcv.columns if vol_col else False
+
+    if not has_ohlc:
+        # Can't detect wicks without OHLC — use liquidation data only
+        pass
+    else:
+        opens = ohlcv["open"].values
+        highs = ohlcv["high"].values
+        lows = ohlcv["low"].values
+
+        # --- Historical cascade analysis ---
+        # For each candle, compute wick ratio and volume ratio
+        vol_20 = None
+        if has_vol:
+            volumes = ohlcv[vol_col].values
+            # Rolling 20-period average volume
+            vol_rolling = pd.Series(volumes).rolling(20, min_periods=5).mean().values
+
+        cascade_idxs = []
+        for i in range(5, len(close) - 1):
+            body = abs(close[i] - opens[i])
+            lower_wick = min(opens[i], close[i]) - lows[i]  # always >= 0
+            if body < 1e-12:
+                continue
+            wr = lower_wick / body
+
+            vol_ratio = 1.0
+            if has_vol and vol_rolling[i] > 0:
+                vol_ratio = volumes[i] / vol_rolling[i]
+
+            # Cascade condition: wick ratio > 2 AND volume spike > 1.8x
+            if wr > 2.0 and vol_ratio > 1.8:
+                cascade_idxs.append((i, wr, vol_ratio))
+
+        # --- Post-cascade performance (historical) ---
+        post_4h_rets = []
+        for idx, wr, vr in cascade_idxs:
+            if idx + 4 < len(close):
+                ret_4h = (close[idx + 4] - close[idx]) / close[idx]
+                post_4h_rets.append(ret_4h)
+
+        n = len(post_4h_rets)
+        result["historical_n"] = n
+        if n >= 5:
+            result["post_cascade_avg_4h"] = round(float(np.mean(post_4h_rets) * 100), 2)
+            result["post_cascade_hit_rate"] = round(float((np.array(post_4h_rets) > 0).mean()), 3)
+
+        # --- Current state: find most recent cascade ---
+        if cascade_idxs:
+            last_cascade_idx, last_wr, last_vr = cascade_idxs[-1]
+            candles_since = len(close) - 1 - last_cascade_idx
+            result["candles_since_cascade"] = candles_since
+            result["wick_ratio"] = round(last_wr, 2)
+            result["volume_ratio"] = round(last_vr, 2)
+
+            if candles_since <= 1:
+                result["state"] = "CASCADE_IN_PROGRESS"
+                result["cascade_detected"] = True
+            elif candles_since <= 4:
+                result["state"] = "POST_CASCADE_ENTRY"
+                result["cascade_detected"] = True
+            elif candles_since <= 12:
+                result["state"] = "POST_CASCADE_WATCH"
+                result["cascade_detected"] = True
+
+    # --- Augment with Coinalyze liquidation z-score if available ---
+    liquidations = data.get("liquidations")
+    if liquidations is not None and not liquidations.empty:
+        latest_liq = liquidations.iloc[-1]
+        liq_z = float(latest_liq.get("liq_zscore", 0))
+        liq_ratio = float(latest_liq.get("liq_ratio", 0.5))
+        result["liq_zscore"] = round(liq_z, 2)
+        result["liq_ratio_long"] = round(liq_ratio, 3)
+
+        # Override state if liquidation data confirms cascade
+        if liq_z > 2.5 and result["state"] == "NORMAL":
+            result["state"] = "CASCADE_IN_PROGRESS"
+            result["cascade_detected"] = True
+        elif liq_z > 1.5 and result["state"] in ("NORMAL", "POST_CASCADE_WATCH"):
+            if result["state"] == "NORMAL":
+                result["state"] = "POST_CASCADE_WATCH"
+                result["cascade_detected"] = True
+
+    # Also check Coinglass liquidation data if available
+    cg_liq = data.get("coinglass_liquidations")
+    if cg_liq is not None and not cg_liq.empty:
+        latest_cg = cg_liq.iloc[-1]
+        cg_long_liq = float(latest_cg.get("long_liquidations_usd", 0))
+        cg_short_liq = float(latest_cg.get("short_liquidations_usd", 0))
+        cg_total = cg_long_liq + cg_short_liq
+        cg_z = float(latest_cg.get("liq_zscore", 0))
+        result["cg_total_liquidations_usd"] = round(cg_total, 0)
+        result["cg_liq_zscore"] = round(cg_z, 2)
+
+        if cg_z > 2.5:
+            result["state"] = "CASCADE_IN_PROGRESS"
+            result["cascade_detected"] = True
+            if result["liq_zscore"] == 0.0:
+                result["liq_zscore"] = cg_z
+
+    # --- Confidence ---
+    n = result["historical_n"]
+    if result["cascade_detected"]:
+        base_conf = min(1.0, max(result["wick_ratio"] / 5, result["liq_zscore"] / 3))
+        result["confidence"] = round(min(1.0, base_conf * (1 + min(n, 20) / 20)), 2)
+
+    # --- Description ---
+    state = result["state"]
+    if state == "CASCADE_IN_PROGRESS":
+        result["description"] = (
+            f"⚡ LIQUIDATION CASCADE IN PROGRESS — "
+            f"Wick ratio: {result['wick_ratio']:.1f}x | "
+            f"Volume: {result['volume_ratio']:.1f}x avg | "
+            f"Liq z-score: {result['liq_zscore']:.1f}σ. "
+            f"Do NOT enter long here — wait for wick to confirm."
+        )
+    elif state == "POST_CASCADE_ENTRY":
+        n_hist = result["historical_n"]
+        avg = result["post_cascade_avg_4h"]
+        hr = result["post_cascade_hit_rate"]
+        result["description"] = (
+            f"✅ POST-CASCADE ENTRY WINDOW — {result['candles_since_cascade']} candle(s) after wick. "
+            f"Forced sellers exhausted. Historical: {avg:+.1f}% avg 4h return, "
+            f"{hr:.0%} hit rate (n={n_hist}). High-probability long setup."
+        )
+    elif state == "POST_CASCADE_WATCH":
+        result["description"] = (
+            f"👀 Post-cascade watching ({result['candles_since_cascade']} candles after wick). "
+            f"Entry window closing. Monitor for re-test."
+        )
+    elif result["cascade_detected"]:
+        result["description"] = (
+            f"Cascade detected (z-score: {result['liq_zscore']:.1f}σ). "
+            f"Monitor for entry setup."
+        )
+    else:
+        result["description"] = "No liquidation cascade pattern detected. Market structure normal."
+
+    return result
+
+
+# =========================================================================
 # Public API
+# =========================================================================
+# Trade Setup Synthesiser
+# =========================================================================
+
+def _compute_trade_setups(prob, mr, session, btc, settlement, cg_oi_fund, liq_cascade, market_state):
+    """
+    Synthesise sub-model outputs into a prioritised list of concrete trade setups
+    for the current session. Each setup has: id, direction, trigger, confidence,
+    target_pct, stop_note, time_window, session_window, active.
+
+    Calibrated against live data from Apr 2026 Dubai desk session.
+    """
+    import datetime as _dt
+    setups = []
+    now_utc = _dt.datetime.utcnow()
+    dubai_hour = (now_utc.hour + 4) % 24
+
+    prob_val = prob.get("prob_positive_4h", 0.5)
+    lsr_data = mr.get("lsr", {}) or {}
+    lsr_pct = lsr_data.get("percentile", 0.5)
+    lsr_val = lsr_data.get("current", 1.0)
+    settlement_mins = settlement.get("mins_to_settlement") or 999
+    settlement_phase = settlement.get("phase", "MID_CYCLE")
+    post_mean = settlement.get("post_ret_mean") or 0.0
+    pre_mean = settlement.get("pre_ret_mean") or 0.0
+    settlement_conf = settlement.get("confidence", 0.0)
+    funding_sign = settlement.get("current_funding_sign", "NEUTRAL")
+    avg_funding = market_state.get("avg_funding", 0)
+    dubai_settle = settlement.get("dubai_settlement_time", "")
+    oi_assessment = cg_oi_fund.get("oi_assessment", "NORMAL") if cg_oi_fund.get("available") else "NORMAL"
+    btc_div = prob.get("btc_divergence", False)
+    cascade = liq_cascade.get("cascade_detected", False)
+    post_cascade_4h = liq_cascade.get("post_cascade_avg_4h", 0)
+
+    # ── Setup 1: POST-SETTLEMENT FADE ─────────────────────────────────────────
+    # Best structural trade of the day. Fires when inside the post-settlement window
+    # OR when mid-cycle but the upcoming setup is well-defined.
+    # NOTE: funding_sign here is the SYNTHETIC signal's sign. The real Bybit funding
+    # is almost always positive (floor = +0.5%/8h). Treat the post_ret_mean direction
+    # as the structural edge regardless of synthetic funding sign.
+    if abs(post_mean) > 0.05 and settlement_conf > 0.4:
+        post_direction = "short" if post_mean < 0 else "long"
+        post_action_verb = "fade the spike" if post_mean < 0 else "buy the dip"
+
+        if settlement_phase == "JUST_SETTLED":
+            active = True
+            trigger = (
+                f"Settlement just occurred — {post_direction} now on any "
+                f"{'bounce' if post_mean < 0 else 'pullback'}"
+            )
+            time_note = "Active now"
+        elif settlement_mins <= 180:
+            active = True
+            trigger = (
+                f"Watch for price {'spike' if post_mean < 0 else 'dip'} into {dubai_settle} → "
+                f"{post_action_verb} when price stalls at settlement"
+            )
+            time_note = f"{settlement_mins:.0f}min to setup ({dubai_settle})"
+        else:
+            active = False
+            trigger = f"Wait — setup opens ~60min before {dubai_settle}"
+            time_note = f"Opens in ~{max(0, settlement_mins - 60):.0f}min"
+
+        setups.append({
+            "id": "POST_SETTLEMENT_FADE",
+            "direction": post_direction,
+            "trigger": trigger,
+            "target_pct": round(abs(post_mean), 2),
+            "stop_note": "Stop above settlement spike high" if post_mean < 0 else "Stop below settlement dip low",
+            "confidence": round(settlement_conf, 2),
+            "historical_edge": f"{post_mean:+.2f}% avg post-settlement (n={settlement.get('historical_n', 0)})",
+            "time_window": time_note,
+            "active": active,
+            "priority": 1,
+        })
+
+    # ── Setup 2: LSR EXHAUSTION SHORT ─────────────────────────────────────────
+    # LSR at extreme levels → structural forced unwind within ~8h (93% hit rate)
+    if lsr_pct > 0.80 and prob_val < 0.50:
+        conf = round(min(0.85, lsr_pct * lsr_data.get("revert_rate", 0.93)), 2)
+        setups.append({
+            "id": "LSR_EXHAUSTION_SHORT",
+            "direction": "short",
+            "trigger": (
+                f"LSR at {lsr_val:.2f} ({lsr_pct:.0%} percentile) — longs are structurally crowded. "
+                f"Enter short on any 0.5-1% bounce from current price."
+            ),
+            "target_pct": round(lsr_data.get("avg_revert_time_h", 8) * 0.05, 2),
+            "stop_note": "Stop above recent swing high, reduce if LSR drops below 1.5",
+            "confidence": conf,
+            "historical_edge": (
+                f"LSR reversion within ~{lsr_data.get('avg_revert_time_h', 8):.0f}h, "
+                f"{lsr_data.get('revert_rate', 0.93):.0%} hit rate"
+            ),
+            "time_window": f"~{lsr_data.get('avg_revert_time_h', 8):.0f}h window",
+            "active": True,
+            "priority": 2,
+        })
+
+    # ── Setup 3: BTC DIVERGENCE RESOLUTION ────────────────────────────────────
+    # FART not following BTC rally despite BTC being up = structural weakness
+    if btc_div and prob_val < 0.47:
+        btc_2h = btc.get("btc_2h_return_pct", 0)
+        setups.append({
+            "id": "BTC_DIVERGENCE_RESOLUTION",
+            "direction": "short",
+            "trigger": (
+                f"BTC rallied {btc_2h:+.1f}% but FART model is bearish at {prob_val:.0%}. "
+                f"Confirm: if FART price doesn't follow BTC within 1-2h, short the divergence. "
+                f"Entry: when FART stalls or rolls over while BTC holds."
+            ),
+            "target_pct": round(abs(prob.get("expected_move_pct", 1.0)), 2),
+            "stop_note": "Stop if FART breaks out above the BTC-implied level",
+            "confidence": round(btc.get("confidence", 0.5) * 0.8, 2),
+            "historical_edge": "FART-BTC divergence: 91% directional accuracy on resolution",
+            "time_window": "Confirm within 1-2h of BTC move",
+            "active": True,
+            "priority": 3,
+        })
+
+    # ── Setup 4: OI BUILDING PRICE WEAK ───────────────────────────────────────
+    if oi_assessment == "OI_BUILDING_PRICE_WEAK":
+        setups.append({
+            "id": "OI_BUILDING_PRICE_WEAK",
+            "direction": "short",
+            "trigger": (
+                "OI building while price is declining — longs being trapped. "
+                "Enter short on failed recovery attempts (price bounces but can't reclaim prior high)."
+            ),
+            "target_pct": 0.50,
+            "stop_note": "Stop above OI-buildup range high",
+            "confidence": 0.55,
+            "historical_edge": "-0.25% avg 4h, 44% hit rate (same as trend-chase exhaustion)",
+            "time_window": "4-8h window",
+            "active": True,
+            "priority": 4,
+        })
+
+    # ── Setup 5: POST-SETTLEMENT MICRO-LONG (conditional) ────────────────────
+    # Only if model crosses 55% — pre-settlement, positive funding, historically +pre_mean
+    if funding_sign == "POSITIVE" and pre_mean > 0.05 and settlement_mins <= 90 and prob_val >= 0.55:
+        setups.append({
+            "id": "PRE_SETTLEMENT_MICRO_LONG",
+            "direction": "long",
+            "trigger": (
+                f"Model ≥55% + pre-settlement window ({settlement_mins:.0f}min to {dubai_settle}). "
+                f"Enter long now, exit AT settlement. Do NOT hold through."
+            ),
+            "target_pct": round(pre_mean, 2),
+            "stop_note": "Hard exit at settlement regardless of P&L",
+            "confidence": round(settlement_conf * 0.7, 2),
+            "historical_edge": f"Pre-settlement avg: +{pre_mean:.2f}% with positive funding (n={settlement.get('historical_n', 0)})",
+            "time_window": f"Active now — exit at {dubai_settle}",
+            "active": True,
+            "priority": 5,
+        })
+
+    # ── Setup 6: POST-CASCADE ENTRY ───────────────────────────────────────────
+    if cascade and post_cascade_4h > 0:
+        setups.append({
+            "id": "POST_CASCADE_ENTRY",
+            "direction": "long",
+            "trigger": (
+                "Liquidation cascade just occurred. Enter long as sellers exhaust. "
+                "Look for stabilisation candle with lower wick."
+            ),
+            "target_pct": round(post_cascade_4h, 2),
+            "stop_note": "Stop below cascade low",
+            "confidence": round(liq_cascade.get("confidence", 0.6), 2),
+            "historical_edge": f"Post-cascade avg: +{post_cascade_4h:.2f}% in 4h ({liq_cascade.get('post_cascade_hit_rate', 0):.0%} hit rate)",
+            "time_window": "4h window post-cascade",
+            "active": True,
+            "priority": 6,
+        })
+
+    # ── NO TRADE scenario ─────────────────────────────────────────────────────
+    if not setups or all(not s["active"] for s in setups):
+        setups.append({
+            "id": "NO_TRADE",
+            "direction": "flat",
+            "trigger": f"Model at {prob_val:.0%} — below 55% threshold, no edge after Bybit carry costs.",
+            "target_pct": 0,
+            "stop_note": "N/A",
+            "confidence": 0,
+            "historical_edge": "No valid setup detected",
+            "time_window": "Wait for setup",
+            "active": False,
+            "priority": 99,
+        })
+
+    # Sort by priority
+    setups.sort(key=lambda s: s["priority"])
+    return setups
+
+
 # =========================================================================
 
 def compute_projections(data, market_state):
@@ -1113,12 +2316,136 @@ def compute_projections(data, market_state):
     cycle = _detect_hourly_manipulation_cycle(data, market_state)
     session = _project_session_conditional(data, market_state)
     btc = _project_btc_lead_lag(data, market_state)
+
+    # --- Funding level context for BTC interaction signals ---
+    # Get current funding percentile from historical data
+    _funding_data = data.get("funding")
+    _ohlcv_data = data.get("ohlcv")
+    _fund_pct_val = 0.0
+    _fund_extreme_low = False
+    _fund_extreme_high = False
+    if _funding_data is not None and len(_funding_data) > 50:
+        try:
+            _fund_col = _funding_data.columns[0]
+            _cur_fund = float(_funding_data[_fund_col].iloc[-1])
+            _fund_ptile = float((_funding_data[_fund_col] < _cur_fund).mean())
+            _fund_pct_val = _cur_fund * 100
+            _fund_extreme_low  = _fund_ptile < 0.25   # bottom quartile
+            _fund_extreme_high = _fund_ptile > 0.75   # top quartile
+        except Exception:
+            pass
+
+    # BTC OVERRIDE: When BTC has a big move (>1.5% in 2h) with high confidence,
+    # override the probability model. BTC had 100% accuracy on big moves this week.
+    #
+    # BACKTEST-CALIBRATED (90 days):
+    #   BTC dump >2% + Fund LOW:  +1.22% avg 4h, 68% hit — STRONG BUY
+    #   BTC rally >2% + Fund HIGH: -1.27% avg 4h, 24% hit — STRONG AVOID
+    btc_abs = abs(btc.get("btc_2h_return_pct", 0))
+    btc_conf = btc.get("confidence", 0)
+    btc_2h_ret = btc.get("btc_2h_return_pct", 0)
+
+    # Special case: BTC dump + low funding — best setup in the data (68% hit, +1.22% avg)
+    if btc_2h_ret < -2.0 and _fund_extreme_low and btc_conf > 0.4:
+        prob["prob_positive_4h"] = max(prob["prob_positive_4h"], 0.68)
+        prob["expected_move_pct"] = abs(prob.get("expected_move_pct", 1.0))
+        prob["btc_override"] = True
+        prob["btc_override_type"] = "BTC_DUMP_LOW_FUND_BUY"
+        prob["description"] += (
+            f" [⭐ BTC DUMP+LOW FUND OVERRIDE: BTC {btc_2h_ret:+.1f}% + fund low "
+            f"→ HIGH-CONV LONG (68% hist hit, +1.22% avg 4h)]"
+        )
+    # Special case: BTC rally + high funding — worst setup (24% hit, -1.27% avg) — don't chase
+    elif btc_2h_ret > 2.0 and _fund_extreme_high and prob["prob_positive_4h"] > 0.5:
+        prob["prob_positive_4h"] = min(prob["prob_positive_4h"], 0.40)
+        prob["expected_move_pct"] = -abs(prob.get("expected_move_pct", 1.0))
+        prob["btc_override"] = True
+        prob["btc_override_type"] = "BTC_RALLY_HIGH_FUND_FADE"
+        prob["description"] += (
+            f" [⚠ BTC RALLY+HIGH FUND OVERRIDE: BTC +{btc_2h_ret:.1f}% + fund high "
+            f"→ DON'T CHASE (24% hist hit, -1.27% avg 4h)]"
+        )
+    # Standard BTC direction override for large moves
+    elif btc_abs > 1.5 and btc_conf > 0.5:
+        btc_direction = "up" if btc_2h_ret > 0 else "down"
+
+        # DIVERGENCE GUARD (calibrated Apr 2026):
+        # When BTC is rallying BUT both major exchanges are crowded long (BOTH_CROWDED_LONG)
+        # AND LSR is at extreme (>p75), FART's failure to follow BTC is itself a bearish signal.
+        # These are the conditions where the bullish BTC override backfires.
+        # Observed: BTC +0.8% but FART model 42% → price stalled, bearish resolution.
+        _cg_oi_fund = data.get("coinglass_oi") or {}
+        _lsr_data = data.get("lsr")
+        _lsr_pct = 0.5
+        if _lsr_data is not None and not (isinstance(_lsr_data, pd.DataFrame) and _lsr_data.empty):
+            try:
+                _lsr_col = "longShortRatio" if "longShortRatio" in _lsr_data.columns else _lsr_data.columns[0]
+                _lsr_s = _lsr_data[_lsr_col].dropna()
+                _lsr_pct = float((_lsr_s < float(_lsr_s.iloc[-1])).mean())
+            except Exception:
+                pass
+
+        _both_crowded = False
+        try:
+            _avg_fund_pct = float(market_state.get("avg_funding", 0)) * 100
+            _both_crowded = (_avg_fund_pct > 0.4 and _fund_extreme_high)  # both sides elevated
+        except Exception:
+            pass
+
+        _fart_lagging_btc = (
+            btc_direction == "up"
+            and prob["prob_positive_4h"] < 0.47
+            and _lsr_pct > 0.75
+            and _both_crowded
+        )
+
+        if _fart_lagging_btc:
+            # FART is NOT following BTC rally despite BTC being up — structural weakness signal
+            # Keep/reinforce the bearish signal, suppress the BTC bullish override
+            prob["btc_divergence"] = True
+            prob["btc_divergence_type"] = "FART_LAGGING_BTC_RALLY"
+            prob["description"] += (
+                f" [⚠ BTC DIVERGENCE: BTC +{btc_abs:.1f}% but FART model at "
+                f"{prob['prob_positive_4h']:.0%} with crowded longs (LSR p{_lsr_pct:.0%}) — "
+                f"FART failing to follow BTC = structural weakness. "
+                f"If FART doesn't catch up within 1-2h, bearish resolution likely. "
+                f"BTC bullish override SUPPRESSED.]"
+            )
+        elif btc_direction == "up" and prob["prob_positive_4h"] < 0.6:
+            prob["prob_positive_4h"] = max(prob["prob_positive_4h"], 0.65)
+            prob["expected_move_pct"] = abs(prob["expected_move_pct"])
+            prob["btc_override"] = True
+            prob["btc_override_type"] = "BTC_DIRECTION"
+            prob["description"] += (
+                f" [BTC OVERRIDE: BTC +{btc_abs:.1f}% → forcing bullish bias, "
+                f"confidence {btc_conf:.0%}]"
+            )
+        elif btc_direction == "down" and prob["prob_positive_4h"] > 0.4:
+            prob["prob_positive_4h"] = min(prob["prob_positive_4h"], 0.35)
+            prob["expected_move_pct"] = -abs(prob["expected_move_pct"])
+            prob["btc_override"] = True
+            prob["btc_override_type"] = "BTC_DIRECTION"
+            prob["description"] += (
+                f" [BTC OVERRIDE: BTC -{btc_abs:.1f}% → forcing bearish bias, "
+                f"confidence {btc_conf:.0%}]"
+            )
+
     ci = _compute_confidence_intervals(data, market_state, prob)
 
     # New external data models
     news = _project_news_sentiment(data, market_state)
     onchain = _project_onchain_flow(data, market_state)
     cx_derivs = _project_cross_exchange_derivatives(data, market_state)
+    cg_oi_fund = _project_coinglass_oi_funding(data, market_state)
+
+    # New structural models
+    settlement = _project_funding_settlement_cycle(data, market_state)
+    liq_cascade = _detect_liquidation_cascade(data, market_state)
+
+    # Synthesise trade setups from all sub-models
+    trade_setups = _compute_trade_setups(
+        prob, mr, session, btc, settlement, cg_oi_fund, liq_cascade, market_state
+    )
 
     # Build summary string for Slack briefings
     parts = []
@@ -1142,13 +2469,32 @@ def compute_projections(data, market_state):
         parts.append(f"*On-Chain Flow:* {onchain['description']}")
     if cx_derivs.get("available"):
         parts.append(f"*Cross-Exchange:* {cx_derivs['description']}")
+    if cg_oi_fund.get("available"):
+        parts.append(f"*OI/Funding:* {cg_oi_fund['description']}")
+
+    # Settlement cycle: always include (key trade window context)
+    parts.append(f"*Settlement Cycle:* {settlement['description']}")
+    if liq_cascade.get("cascade_detected"):
+        parts.append(f"*Liq Cascade:* {liq_cascade['description']}")
 
     if ci.get("h4"):
         h4 = ci["h4"]
+        thin_note = " ⚠ THIN VOLUME — bands widened" if h4.get("thin_volume") else ""
         parts.append(
             f"*4h Range:* ${h4['low_68']:.4f} – ${h4['high_68']:.4f} (68%) | "
-            f"${h4['low_95']:.4f} – ${h4['high_95']:.4f} (95%)"
+            f"${h4['low_95']:.4f} – ${h4['high_95']:.4f} (95%){thin_note}"
         )
+
+    # Trade setups summary
+    active_setups = [s for s in trade_setups if s["active"]]
+    if active_setups:
+        setup_lines = []
+        for s in active_setups:
+            setup_lines.append(
+                f"  • [{s['id']}] {s['direction'].upper()} — {s['trigger']} "
+                f"(conf: {s['confidence']:.0%}, target: {s['target_pct']:+.2f}%)"
+            )
+        parts.append("*Trade Setups:*\n" + "\n".join(setup_lines))
 
     summary = "\n".join(parts)
 
@@ -1162,5 +2508,9 @@ def compute_projections(data, market_state):
         "news_sentiment": news,
         "onchain_flow": onchain,
         "cross_exchange": cx_derivs,
+        "coinglass_oi_funding": cg_oi_fund,
+        "funding_settlement": settlement,
+        "liq_cascade": liq_cascade,
+        "trade_setups": trade_setups,
         "summary": summary,
     }

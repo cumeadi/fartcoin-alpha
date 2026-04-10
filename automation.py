@@ -21,6 +21,7 @@ from signal_engine import load_data, compute_all_signals
 from market_state import compute_market_state, determine_action
 from alerts import evaluate_alerts, evaluate_projection_alerts
 from projections import compute_projections
+from coin_config import get_config, DEFAULT_COIN
 try:
     from external_collectors import collect_light_external, collect_all_external
     HAS_EXTERNAL = True
@@ -31,22 +32,28 @@ except ImportError:
 DATA_DIR = Path(__file__).parent / "data"
 
 
-def run_pipeline(mode="light"):
+def run_pipeline(mode="light", coin=DEFAULT_COIN):
     """Run the full automation pipeline."""
+    cfg = get_config(coin)
+    cmc_sym  = cfg["cmc_symbol"]
+    perp_sym = cfg["perp_symbol"]
+    cg_id    = cfg["cg_coin_id"]
+
     # Step 1: Collect data
     if mode == "full":
         print("Collecting all data...", file=sys.stderr)
-        collect_all()
+        collect_all(cmc_symbol=cmc_sym, perp_symbol=perp_sym, cg_coin_id=cg_id)
     else:
         print("Light poll (derivatives snapshot)...", file=sys.stderr)
-        poll_once()
+        poll_once(coin_filter=cmc_sym)
 
     # Step 2: Recompute signals
     print("Computing signals...", file=sys.stderr)
-    data = load_data()
+    data = load_data(perp_symbol=perp_sym, cmc_symbol=cmc_sym, cg_coin_id=cg_id)
     signals = compute_all_signals(data)
+    signals_file = DATA_DIR / f"signals_{cmc_sym}.csv"
     if not signals.empty:
-        signals.to_csv(DATA_DIR / "signals.csv")
+        signals.to_csv(signals_file)
         print(f"Signals saved: {len(signals)} rows", file=sys.stderr)
 
     # Step 3: Reload data with fresh signals
@@ -98,17 +105,19 @@ def main():
                         help="light = poll_once + signals; full = collect_all + signals")
     parser.add_argument("--external", action="store_true",
                         help="Also run external collectors (CryptoPanic, Helius, Coinalyze)")
+    parser.add_argument("--coin", default=DEFAULT_COIN,
+                        help=f"Coin to analyse (default: {DEFAULT_COIN})")
     args = parser.parse_args()
 
     # Optionally run external collectors first
     if args.external and HAS_EXTERNAL:
         print("Running external collectors...", file=sys.stderr)
         if args.mode == "full":
-            collect_all_external()
+            collect_all_external(coin=args.coin)
         else:
-            collect_light_external()
+            collect_light_external(coin=args.coin)
 
-    output = run_pipeline(args.mode)
+    output = run_pipeline(args.mode, coin=args.coin)
 
     # Print JSON to stdout (for scheduled task to parse)
     print(json.dumps(output, indent=2, default=str))

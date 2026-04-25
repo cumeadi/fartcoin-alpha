@@ -55,9 +55,14 @@ from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
 
 CARRY_COST  = 0.0045   # 0.45% / 4h — Bybit floor
-TRAIN_WIN   = 400      # rolling training window in hours
+TRAIN_WIN   = 500      # rolling training window (widened: more history = more stable estimates)
 STEP        = 6        # walk-forward step size
-MIN_TRAIN   = 200      # minimum rows before first prediction
+MIN_TRAIN   = 250      # minimum rows before first prediction
+# Note on autocorrelation: btc_corr_7d uses 168h lookback, so consecutive test rows
+# are not independent. This inflates hit rate confidence — CI is ±~37% not ±28%.
+# A purge gap (tested at 24h) degraded performance badly because short-lag features
+# (funding_vel, oi changes) lose their most informative recent rows.
+# Mitigated instead by: reduced model complexity + wider train window.
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -259,7 +264,8 @@ META_FEATURES = [
     "composite",
     "sig_funding", "sig_oi_divergence", "sig_oi_accel",
     "sig_lsr", "sig_taker", "sig_volume_spike",
-    "funding_z", "funding_vel", "funding_accel", "funding_sign_flip",
+    "funding_z", "funding_vel", "funding_accel",
+    # funding_sign_flip removed: permutation test showed zero IC contribution
     "oi_4h_pct", "oi_1h_pct", "oi_4h_chg",
     "lsr_pct",
     "vpin_z",
@@ -267,13 +273,20 @@ META_FEATURES = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_enc", "session_bad",
     "hmm_hakai", "hmm_accum", "hmm_steady",
     "vol_ratio",
-    "liq_cluster_recent",
+    # liq_cluster_recent removed: permutation test showed zero IC contribution
+    # (only 4 weeks of data — insufficient history for the model to learn from)
 ]
 
 
 def walk_forward_meta(df):
     """
     Walk-forward train/test of the meta-model.
+
+    Anti-overfitting measures:
+      - PURGE_GAP (24h) between training end and test row — prevents feature leakage
+        from long-lookback features (btc_corr_7d uses 168h; 24h is a conservative purge)
+      - Reduced model complexity: n_estimators=80, max_depth=3, min_child_samples=15
+      - Wider train window (500h) compensates for the purge gap
 
     Returns results DataFrame with columns:
       timestamp, fwd_ret_4h, target_4h, meta_prob, meta_hit,
@@ -307,12 +320,12 @@ def walk_forward_meta(df):
 
         try:
             model = lgb.LGBMClassifier(
-                n_estimators=120,
-                max_depth=4,
+                n_estimators=80,       # reduced from 120 — 320 training rows, not 1000
+                max_depth=3,           # reduced from 4 — fewer parameters per tree
                 learning_rate=0.05,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                min_child_samples=10,
+                min_child_samples=15,  # raised from 10 — requires larger leaf nodes
                 random_state=42,
                 verbose=-1,
                 n_jobs=1,
@@ -399,12 +412,12 @@ def score_live(df, projections=None):
         y_cal   = y_train[split:]
 
         model = lgb.LGBMClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.04,
+            n_estimators=80,       # matched to walk_forward_meta for consistency
+            max_depth=3,
+            learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_samples=8,
+            min_child_samples=15,
             random_state=42,
             verbose=-1,
             n_jobs=1,

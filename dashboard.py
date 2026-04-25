@@ -358,6 +358,67 @@ with tab_proj:
         unsafe_allow_html=True,
     )
 
+    # ── Opportunity Score Meter ───────────────────────────────────────────────
+    opp = proj.get("opportunity", {})
+    if opp.get("available"):
+        score     = opp.get("score", 50)
+        tier      = opp.get("tier", "WATCH")
+        size_pct  = opp.get("size_pct", 0)
+        hmm_label = opp.get("hmm_label", "—")
+        meta_prob = opp.get("meta_prob", 0.5)
+        top_drv   = opp.get("top_drivers", [])
+
+        tier_colors = {
+            "BLOCKED":          ("#b71c1c", "🚫"),
+            "PASS":             ("#37474f", "⏸️"),
+            "WATCH":            ("#e65100", "👁️"),
+            "TRADE":            ("#1b5e20", "✅"),
+            "HIGH CONVICTION":  ("#00695c", "🔥"),
+            "FULL SEND":        ("#004d40", "⚡"),
+        }
+        tier_col, tier_icon = tier_colors.get(tier, ("#37474f", ""))
+
+        # Score bar fill colour (red→yellow→green)
+        bar_color = "#b71c1c" if score < 35 else "#e65100" if score < 50 else "#f9a825" if score < 60 else "#2e7d32"
+
+        st.markdown("#### 🎯 Opportunity Score")
+        opp_left, opp_right = st.columns([2, 1])
+        with opp_left:
+            st.markdown(
+                f'<div style="background:#1a1a2e;border:1px solid {tier_col};border-radius:10px;padding:16px 20px">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                f'<span style="font-size:2rem;font-weight:900;color:{bar_color}">{score}<span style="font-size:1rem;color:#888">/100</span></span>'
+                f'<span style="background:{tier_col};color:#fff;border-radius:6px;padding:4px 14px;'
+                f'font-size:0.9rem;font-weight:700">{tier_icon} {tier}</span>'
+                f'</div>'
+                f'<div style="background:#263238;border-radius:6px;height:10px;margin-bottom:10px">'
+                f'<div style="background:{bar_color};width:{score}%;height:100%;border-radius:6px;'
+                f'transition:width 0.5s"></div></div>'
+                f'<div style="display:flex;gap:20px;font-size:0.82rem;color:#aaa">'
+                f'<span>Meta-prob: <b style="color:#fff">{meta_prob:.0%}</b></span>'
+                f'<span>HMM: <b style="color:#fff">{hmm_label}</b></span>'
+                f'<span>Position size: <b style="color:{bar_color}">{size_pct}%</b></span>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+        with opp_right:
+            if top_drv:
+                drv_html = '<div style="background:#1a1a2e;border:1px solid #37474f;border-radius:8px;padding:12px">'
+                drv_html += '<div style="font-size:0.75rem;color:#607d8b;margin-bottom:6px">TOP SIGNAL DRIVERS</div>'
+                for feat, imp in top_drv[:4]:
+                    feat_display = feat.replace("sig_", "").replace("_", " ").upper()
+                    bar_w = int(imp / (top_drv[0][1] + 1e-9) * 100)
+                    drv_html += (
+                        f'<div style="margin-bottom:5px">'
+                        f'<div style="font-size:0.72rem;color:#ccc">{feat_display}</div>'
+                        f'<div style="background:#263238;border-radius:3px;height:5px">'
+                        f'<div style="background:#00d4aa;width:{bar_w}%;height:100%;border-radius:3px"></div>'
+                        f'</div></div>'
+                    )
+                drv_html += '</div>'
+                st.markdown(drv_html, unsafe_allow_html=True)
+        st.markdown("")
+
     # ── Trade Setups Panel ────────────────────────────────────────────────────
     trade_setups = proj.get("trade_setups", [])
     active_setups   = [s for s in trade_setups if s.get("active") and s["id"] != "NO_TRADE"]

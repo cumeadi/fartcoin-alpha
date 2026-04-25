@@ -29,6 +29,12 @@ try:
     _HMM_AVAILABLE = True
 except ImportError:
     _HMM_AVAILABLE = False
+
+try:
+    from trade_scorer import build_meta_features, score_live as _score_live_meta
+    _SCORER_AVAILABLE = True
+except ImportError:
+    _SCORER_AVAILABLE = False
 from datetime import datetime, timezone
 
 from market_state import (
@@ -2760,6 +2766,15 @@ def compute_projections(data, market_state):
         )
         cycle["confidence"] = min(cycle.get("confidence", 0.5) + 0.15, 0.95)
 
+    # ── Meta-model opportunity score ─────────────────────────────────────
+    opportunity = {"score": 50, "tier": "WATCH", "available": False}
+    if _SCORER_AVAILABLE:
+        try:
+            meta_df = build_meta_features(data)
+            opportunity = _score_live_meta(meta_df)
+        except Exception as _e:
+            opportunity["error"] = str(_e)
+
     # --- Funding level context for BTC interaction signals ---
     # Get current funding percentile from historical data
     _funding_data = data.get("funding")
@@ -2922,6 +2937,8 @@ def compute_projections(data, market_state):
         parts.append(f"*Ghost Long:* {ghost_long['description']}")
     if vpin.get("available") and vpin.get("toxicity") in ("ELEVATED", "EXTREME"):
         parts.append(f"*VPIN Proxy:* {vpin['description']}")
+    if opportunity.get("available"):
+        parts.append(f"*Opportunity Score:* {opportunity['description']}")
 
     # Settlement cycle: always include (key trade window context)
     parts.append(f"*Settlement Cycle:* {settlement['description']}")
@@ -2965,6 +2982,7 @@ def compute_projections(data, market_state):
         "ghost_long": ghost_long,
         "hmm_regime": hmm_regime,
         "vpin_proxy": vpin,
+        "opportunity": opportunity,
         "trade_setups": trade_setups,
         "summary": summary,
     }

@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -105,6 +107,82 @@ def run_pipeline(mode="light", coin=DEFAULT_COIN):
     return output
 
 
+def _log_trade_journal(output, data_dir):
+    """
+    Append this pipeline run to the trade journal CSV.
+
+    Columns:
+      timestamp, mode, direction, conviction, composite, score, tier,
+      kelly_fraction, size_pct, hmm_regime, fart_price, btc_price,
+      avg_funding, session, alerts_n
+
+    On the next run, also resolves the previous row's outcome:
+      outcome_4h (actual 4h price change %), hit (1/0 vs carry cost)
+    """
+    import csv
+    from datetime import datetime, timezone
+
+    journal_path = data_dir / "trade_journal.csv"
+    ms    = output["market_state"]
+    proj  = output.get("projections", {})
+    opp   = proj.get("opportunity", {})
+    hmm   = proj.get("hmm_regime", {})
+
+    now   = datetime.now(timezone.utc).isoformat()
+    price = ms.get("fart_price", 0)
+
+    row_data = {
+        "timestamp":      now,
+        "mode":           output.get("mode", ""),
+        "direction":      ms.get("direction", ""),
+        "conviction":     ms.get("conviction", ""),
+        "composite":      ms.get("composite", 0),
+        "score":          opp.get("score", 0),
+        "tier":           opp.get("tier", ""),
+        "kelly_fraction": opp.get("kelly_fraction", 0),
+        "size_pct":       opp.get("size_pct", 0),
+        "hmm_regime":     hmm.get("regime_label", ""),
+        "hmm_conf":       hmm.get("confidence", 0),
+        "fart_price":     price,
+        "btc_price":      ms.get("btc_price", 0),
+        "avg_funding":    ms.get("avg_funding", 0),
+        "session":        ms.get("session", ""),
+        "alerts_n":       len(output.get("alerts", [])),
+        "outcome_4h":     "",   # filled in by next run
+        "hit":            "",   # filled in by next run
+    }
+
+    # ── Resolve previous row's outcome ───────────────────────────────────────
+    if journal_path.exists():
+        try:
+            prev_df = pd.read_csv(journal_path)
+            if len(prev_df) > 0 and "fart_price" in prev_df.columns:
+                last_row = prev_df.iloc[-1]
+                if str(last_row.get("outcome_4h", "")).strip() == "" and float(last_row.get("fart_price", 0)) > 0:
+                    last_price = float(last_row["fart_price"])
+                    outcome    = (price - last_price) / last_price
+                    hit        = 1 if outcome > 0.0045 else 0
+                    prev_df.iloc[-1, prev_df.columns.get_loc("outcome_4h")] = round(outcome * 100, 4)
+                    prev_df.iloc[-1, prev_df.columns.get_loc("hit")]        = hit
+                    prev_df.to_csv(journal_path, index=False)
+                    print(f"  [journal] Resolved last entry: outcome={outcome:+.3%}, hit={hit}", file=sys.stderr)
+        except Exception as _e:
+            print(f"  [journal] Outcome resolution failed: {_e}", file=sys.stderr)
+
+    # ── Append new row ────────────────────────────────────────────────────────
+    try:
+        fieldnames = list(row_data.keys())
+        write_header = not journal_path.exists()
+        with open(journal_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row_data)
+        print(f"  [journal] Logged: {ms.get('direction')} @ ${price:.6f} | score={opp.get('score',0)} | {opp.get('tier','')}", file=sys.stderr)
+    except Exception as _e:
+        print(f"  [journal] Write failed: {_e}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fartcoin Alpha Automation Pipeline")
     parser.add_argument("--mode", choices=["light", "full", "snapshot"], default="light",
@@ -132,16 +210,22 @@ def main():
 
     output = run_pipeline(args.mode, coin=args.coin)
 
+    # Log to trade journal (non-snapshot runs only — snapshot has no fresh price)
+    if args.mode != "snapshot":
+        _log_trade_journal(output, DATA_DIR)
+
     # Print JSON to stdout (for scheduled task to parse)
     print(json.dumps(output, indent=2, default=str))
 
     # Summary to stderr
     n_alerts = len(output["alerts"])
     ms = output["market_state"]
+    opp = output.get("projections", {}).get("opportunity", {})
     print(f"\n--- Pipeline Complete ---", file=sys.stderr)
     print(f"Mode: {args.mode}", file=sys.stderr)
     print(f"Signal: {ms['direction']} ({ms['conviction']}, composite={ms['composite']:+.4f})", file=sys.stderr)
     print(f"Session: {ms['session']}", file=sys.stderr)
+    print(f"Opportunity: score={opp.get('score',0)}/100 tier={opp.get('tier','')} kelly={opp.get('kelly_fraction',0):.1%} size={opp.get('size_pct',0)}%", file=sys.stderr)
     print(f"Alerts triggered: {n_alerts}", file=sys.stderr)
 
 

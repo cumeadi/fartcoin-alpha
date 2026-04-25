@@ -1885,11 +1885,13 @@ def _project_funding_settlement_cycle(data, state):
                 f"in 2h after settlement with positive funding (n={n}). "
                 f"Short on any bounce. Target: -{abs(post_mean):.2f}%."
             )
-        elif post_mean > 0:
+        elif post_mean > 0 and post_consistency > 0.54:
+            # Only show bounce when the historical hit rate is genuinely above coin-flip.
+            # Negative funding → 49.6% actual hit rate = no edge. Skip.
             trade_setup = "POST_SETTLEMENT_BOUNCE"
             trade_setup_desc = (
                 f"POST-SETTLEMENT BOUNCE — historically +{post_mean:.2f}% in 2h "
-                f"after settlement (n={n}). Only if model ≥55%."
+                f"after settlement (n={n}, {post_consistency:.0%} hit). Only if model ≥55%."
             )
 
     else:
@@ -2157,12 +2159,13 @@ def _compute_trade_setups(prob, mr, session, btc, settlement, cg_oi_fund, liq_ca
     post_cascade_4h = liq_cascade.get("post_cascade_avg_4h", 0)
 
     # ── Setup 1: POST-SETTLEMENT FADE ─────────────────────────────────────────
-    # Best structural trade of the day. Fires when inside the post-settlement window
-    # OR when mid-cycle but the upcoming setup is well-defined.
-    # NOTE: funding_sign here is the SYNTHETIC signal's sign. The real Bybit funding
-    # is almost always positive (floor = +0.5%/8h). Treat the post_ret_mean direction
-    # as the structural edge regardless of synthetic funding sign.
-    if abs(post_mean) > 0.05 and settlement_conf > 0.4:
+    # Best structural trade of the day. Data shows:
+    #   Positive funding settle → 54.5% short hit rate, −0.21% avg (REAL EDGE)
+    #   Negative funding settle → 49.6% long hit rate, −0.06% avg (COIN FLIP — skip)
+    # Bounce direction (long) only shown when settlement_conf > 0.54 (above coin-flip).
+    _is_fade_dir  = (post_mean < 0)
+    _bounce_valid = (post_mean > 0 and settlement_conf > 0.54)
+    if abs(post_mean) > 0.05 and settlement_conf > 0.4 and (_is_fade_dir or _bounce_valid):
         post_direction = "short" if post_mean < 0 else "long"
         post_action_verb = "fade the spike" if post_mean < 0 else "buy the dip"
 

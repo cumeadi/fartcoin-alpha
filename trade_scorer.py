@@ -141,7 +141,19 @@ def build_meta_features(data):
     df["oi_4h_chg"] = pd.Series(oi_vals).pct_change(4).values
 
     # ── Funding velocity proxy (synthetic: ΔfundingRate 4h) ─────────────────
-    df["funding_vel"] = pd.Series(funding).diff(4).values / (fund_std + 1e-9)
+    fund_s = pd.Series(funding)
+    df["funding_vel"] = fund_s.diff(4).values / (fund_std + 1e-9)
+
+    # ── Funding momentum (2nd derivative) ────────────────────────────────────
+    # Positive accel = funding rising (longs paying more) = bearish pressure
+    # Negative accel = funding falling toward floor = accumulation setup
+    df["funding_accel"] = fund_s.diff(4).diff(4).values / (fund_std + 1e-9)
+
+    # Funding sign flip (transition event in last 8h = regime inflection)
+    fund_signs = pd.Series(np.sign(funding))
+    df["funding_sign_flip"] = fund_signs.rolling(8, min_periods=2).apply(
+        lambda x: 1.0 if (x.max() > 0 and x.min() <= 0) else 0.0, raw=True
+    ).fillna(0.0).values
 
     # ── VPIN proxy: rolling 8h buckets ──────────────────────────────────────
     vpin_vals = np.zeros(n)
@@ -159,14 +171,43 @@ def build_meta_features(data):
     vpin_std  = np.nanstd(vpin_vals[vpin_vals > 0]) + 1e-9
     df["vpin_z"] = (vpin_vals - vpin_mean) / vpin_std
 
-    # ── BTC lead-lag ─────────────────────────────────────────────────────────
+    # ── Liquidation cluster proximity (Coinalyze data) ───────────────────────
+    # High recent liq_zscore = active cascade = dangerous entry environment
+    try:
+        _liq_path = Path(__file__).parent / "data" / "coinalyze_liquidations.csv"
+        if _liq_path.exists():
+            _liq = pd.read_csv(_liq_path, index_col=0, parse_dates=True)
+            if "liq_zscore" in _liq.columns:
+                _lz = _liq["liq_zscore"].fillna(0)
+                _lz.index = pd.to_datetime(_lz.index).floor("h")
+                _lz_8h = _lz.rolling(8, min_periods=1).max()
+                _ohlcv_h = pd.to_datetime(ohlcv.index).floor("h")
+                _aligned = _lz_8h.reindex(_ohlcv_h, method="ffill").fillna(0)
+                df["liq_cluster_recent"] = _aligned.values[:n]
+            else:
+                df["liq_cluster_recent"] = 0.0
+        else:
+            df["liq_cluster_recent"] = 0.0
+    except Exception:
+        df["liq_cluster_recent"] = 0.0
+
+    # ── BTC lead-lag + rolling correlation regime ────────────────────────────
     if btc_df is not None and len(btc_df) > 0:
-        btc_col    = "price" if "price" in btc_df.columns else btc_df.columns[0]
-        btc_prices = btc_df[btc_col].values[:n].astype(float)
+        btc_col_   = "price" if "price" in btc_df.columns else btc_df.columns[0]
+        btc_prices = btc_df[btc_col_].values[:n].astype(float)
         btc_2h     = np.diff(btc_prices, prepend=btc_prices[0]) / (btc_prices + 1e-9)
-        df["btc_2h_ret"] = btc_2h[:n]   # clip to n to handle length mismatches
+        df["btc_2h_ret"] = btc_2h[:n]
+        # Rolling 168h BTC-FART return correlation
+        # High (>0.7) = BTC lead-lag signals are reliable; Low (<0.4) = FART solo regime
+        fart_ret_s = pd.Series(np.diff(prices, prepend=prices[0]) / (prices + 1e-9))
+        btc_ret_s  = pd.Series(btc_2h[:n])
+        df["btc_corr_7d"] = (
+            fart_ret_s.rolling(168, min_periods=48).corr(btc_ret_s)
+            .fillna(0.65).values  # fill with historical mean
+        )
     else:
-        df["btc_2h_ret"] = 0.0
+        df["btc_2h_ret"]  = 0.0
+        df["btc_corr_7d"] = 0.65
 
     # ── Session & time encoding (cyclic) ─────────────────────────────────────
     try:
@@ -186,6 +227,10 @@ def build_meta_features(data):
                   np.where((hours >= 13) & (hours < 17), 2,
                   np.where((hours >= 17) & (hours < 22), 3, 0)))
     df["session_enc"] = session_enc
+
+    # Bad-session gate feature: 20-24h UTC = 41.7% historical hit rate (no edge)
+    # Exposed to walk-forward model AND used as a hard gate in walk_forward_meta()
+    df["session_bad"] = (hours >= 20).astype(int)
 
     # ── HMM regime (walk-forward via hmm_engine — single source of truth) ───────
     print("  [meta] Computing rolling HMM regime labels (hmm_engine)...", flush=True)
@@ -214,14 +259,15 @@ META_FEATURES = [
     "composite",
     "sig_funding", "sig_oi_divergence", "sig_oi_accel",
     "sig_lsr", "sig_taker", "sig_volume_spike",
-    "funding_z", "funding_vel",
+    "funding_z", "funding_vel", "funding_accel", "funding_sign_flip",
     "oi_4h_pct", "oi_1h_pct", "oi_4h_chg",
     "lsr_pct",
     "vpin_z",
-    "btc_2h_ret",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_enc",
+    "btc_2h_ret", "btc_corr_7d",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_enc", "session_bad",
     "hmm_hakai", "hmm_accum", "hmm_steady",
     "vol_ratio",
+    "liq_cluster_recent",
 ]
 
 
@@ -276,11 +322,15 @@ def walk_forward_meta(df):
             X_test = row[available_features].values.reshape(1, -1)
             prob   = float(model.predict_proba(X_test)[0, 1])
 
-            # ── Fix 2: Hard HAKAI gate ────────────────────────────────────
-            # HAKAI = distribution phase. No new entries regardless of model prob.
-            # Force meta_trade=0 for all HAKAI rows — the model should not trade here.
-            is_hakai   = int(row["hmm_hakai"] > 0.5)
-            meta_trade = int(prob > 0.55 and not is_hakai)
+            # ── Hard gates: HAKAI regime + bad session ─────────────────
+            is_hakai = int(row["hmm_hakai"] > 0.5)
+            # 20-24h UTC: 41.7% historical hit rate — below carry break-even
+            try:
+                hour_of_row = pd.Timestamp(df.index[i]).hour
+            except Exception:
+                hour_of_row = 12
+            is_bad_session = int(hour_of_row >= 20)
+            meta_trade = int(prob > 0.55 and not is_hakai and not is_bad_session)
 
             results.append({
                 "timestamp":  df.index[i],
@@ -307,8 +357,14 @@ def walk_forward_meta(df):
 
 def score_live(df, projections=None):
     """
-    Train meta-model on all available history (last TRAIN_WIN rows as train),
-    then score the current row. Returns opportunity score dict.
+    Train meta-model on all available history, then score the current row.
+
+    Improvements vs v1:
+      - Isotonic regression calibration (80/20 split within training window)
+      - Kelly position sizing (replaces fixed 50/75/100 tiers)
+      - Session hard gate: 20-24h UTC blocked (41.7% historical hit rate)
+      - New features: btc_corr_7d, funding_accel, funding_sign_flip,
+                      liq_cluster_recent, session_bad
     """
     if not _LGBM_OK:
         return {"score": 50, "tier": "WATCH", "available": False}
@@ -321,6 +377,13 @@ def score_live(df, projections=None):
     train = df.iloc[-(TRAIN_WIN + 1): -1]
     row   = df.iloc[-1]
 
+    # ── Session gate — block entries 20-24h UTC ──────────────────────────────
+    try:
+        current_hour = pd.Timestamp(df.index[-1]).hour
+    except Exception:
+        current_hour = 12
+    is_bad_session = (current_hour >= 20)
+
     X_train = train[available_features].values
     y_train = train["target_4h"].values
 
@@ -328,6 +391,13 @@ def score_live(df, projections=None):
         return {"score": 50, "tier": "WATCH", "available": False}
 
     try:
+        # ── 80/20 in-sample split: fit LightGBM on 80%, calibrate on 20% ────
+        split   = int(len(X_train) * 0.80)
+        X_fit   = X_train[:split]
+        y_fit   = y_train[:split]
+        X_cal   = X_train[split:]
+        y_cal   = y_train[split:]
+
         model = lgb.LGBMClassifier(
             n_estimators=200,
             max_depth=4,
@@ -339,20 +409,35 @@ def score_live(df, projections=None):
             verbose=-1,
             n_jobs=1,
         )
-        model.fit(X_train, y_train)
+        model.fit(X_fit, y_fit)
 
-        X_now = row[available_features].values.reshape(1, -1)
-        prob  = float(model.predict_proba(X_now)[0, 1])
+        X_now    = row[available_features].values.reshape(1, -1)
+        prob_raw = float(model.predict_proba(X_now)[0, 1])
 
-        # Map probability → 0-100 score
-        # 0.50 → 50, 0.65 → 75, 0.35 → 25, etc.
+        # ── Isotonic regression calibration ──────────────────────────────────
+        # Corrects overconfidence at high-probability bins (was 25pp off at 0.8+)
+        prob = prob_raw
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            if len(X_cal) >= 20 and y_cal.sum() >= 3 and (1 - y_cal).sum() >= 3:
+                raw_cal = model.predict_proba(X_cal)[:, 1]
+                ir = IsotonicRegression(out_of_bounds="clip")
+                ir.fit(raw_cal, y_cal)
+                prob = float(ir.predict([prob_raw])[0])
+        except Exception:
+            pass   # fall back to uncalibrated probability
+
+        # ── Map probability → 0-100 score ────────────────────────────────────
         score = int(np.clip((prob - 0.20) / 0.60 * 100, 0, 100))
 
-        # ── Tier classification ──────────────────────────────────────────────
+        # ── Tier classification ───────────────────────────────────────────────
         hmm = int(row.get("hmm_regime", 0))
         if int(row.get("hmm_hakai", 0)) == 1:
-            tier   = "BLOCKED"   # HAKAI — never enter
-            score  = min(score, 25)
+            tier  = "BLOCKED"        # HAKAI — distribution phase
+            score = min(score, 25)
+        elif is_bad_session:
+            tier  = "BLOCKED (SESSION)"   # 20-24h UTC — no edge window
+            score = min(score, 30)
         elif score >= 78:
             tier = "FULL SEND"
         elif score >= 65:
@@ -364,42 +449,53 @@ def score_live(df, projections=None):
         else:
             tier = "PASS"
 
-        # ── Position size recommendation ─────────────────────────────────────
-        size_pct = {
-            "BLOCKED": 0,
-            "PASS": 0,
-            "WATCH": 0,
-            "TRADE": 50,
-            "HIGH CONVICTION": 75,
-            "FULL SEND": 100,
-        }.get(tier, 0)
+        # ── Kelly position sizing ─────────────────────────────────────────────
+        # f* = (p·b − q) / b   where b = avg_win / avg_loss from training history
+        # Uses full Kelly with per-tier ceiling to limit overexposure
+        kelly_f   = 0.0
+        kelly_pct = 0
+        try:
+            train_rets = train["fwd_ret_4h"].values
+            win_rets   = train_rets[train_rets > CARRY_COST]
+            loss_rets  = train_rets[train_rets <= CARRY_COST]
+            avg_win    = float(win_rets.mean())        if len(win_rets)  > 5 else CARRY_COST * 2
+            avg_loss   = float(abs(loss_rets.mean()))  if len(loss_rets) > 5 else CARRY_COST
+            b          = avg_win / (avg_loss + 1e-9)
+            q          = 1.0 - prob
+            kelly_f    = max(0.0, (prob * b - q) / (b + 1e-9))
+            kelly_pct  = int(kelly_f * 100)  # full Kelly as base percentage
+        except Exception:
+            kelly_pct = 0
+
+        # Tier ceiling caps Kelly (can't exceed max for that confidence band)
+        tier_ceiling = {
+            "BLOCKED": 0, "BLOCKED (SESSION)": 0, "PASS": 0, "WATCH": 0,
+            "TRADE": 60, "HIGH CONVICTION": 80, "FULL SEND": 100,
+        }
+        size_pct = min(kelly_pct, tier_ceiling.get(tier, 0))
 
         # ── Feature importance for component breakdown ────────────────────────
-        fi    = model.feature_importances_
-        top_k = 5
-        top_idx   = np.argsort(fi)[::-1][:top_k]
+        fi      = model.feature_importances_
+        top_k   = 5
+        top_idx = np.argsort(fi)[::-1][:top_k]
         top_feats = [(available_features[j], round(float(fi[j]), 3)) for j in top_idx]
-
-        # ── SHAP-style direction (positive = bullish contribution) ────────────
-        # Simple: sign of feature × weight of feature on current row
-        current_vals = row[available_features].values
-        feature_directions = {}
-        for j, fname in enumerate(available_features):
-            direction = "↑" if current_vals[j] * fi[j] > 0 else "↓"
-            feature_directions[fname] = direction
 
         return {
             "score":           score,
             "tier":            tier,
             "meta_prob":       round(prob, 4),
+            "meta_prob_raw":   round(prob_raw, 4),
+            "kelly_fraction":  round(kelly_f, 3),
             "size_pct":        size_pct,
             "hmm_regime":      hmm,
             "hmm_label":       ["STEADY_STATE", "ACCUMULATION", "HAKAI"][min(hmm, 2)],
+            "session_blocked": is_bad_session,
             "top_drivers":     top_feats,
             "available":       True,
             "description":     (
                 f"Opportunity Score: {score}/100 — {tier}. "
-                f"Meta-prob: {prob:.0%}. HMM: {['STEADY_STATE','ACCUMULATION','HAKAI'][min(hmm,2)]}. "
+                f"Meta-prob: {prob:.0%} (raw: {prob_raw:.0%}, Kelly: {kelly_f:.1%}). "
+                f"HMM: {['STEADY_STATE','ACCUMULATION','HAKAI'][min(hmm,2)]}. "
                 f"Recommended size: {size_pct}% of max position."
             ),
         }

@@ -1,0 +1,2 @@
+timestamp,mode,direction,conviction,composite,score,tier,kelly_fraction,size_pct,hmm_regime,hmm_conf,fart_price,btc_price,avg_funding,session,alerts_n,outcome_4h,hit
+2026-04-25T16:20:00.133674+00:00,light,FLAT,N/A,0.1069,15,PASS,0.0,0,HAKAI,0.95,0.198267,77684.59,0.217725,NYC,0,,

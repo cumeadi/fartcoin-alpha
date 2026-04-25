@@ -316,40 +316,79 @@ with tab_signal:
         if _sr.get("available", False):
             _cur_p  = _sr.get("current_price", 0)
             _levels = _sr.get("levels", [])
-            for _lv in _levels:
-                _lv_price     = _lv.get("price", 0)
-                _lv_type      = _lv.get("type", "support")    # "support" or "resistance"
-                _lv_strength  = _lv.get("strength", 0.5)
-                _lv_methods   = _lv.get("methods", [])
-                _opacity      = 0.35 + 0.5 * _lv_strength     # 0.35–0.85 based on strength
-                _color        = "#ef9a9a" if _lv_type == "resistance" else "#a5d6a7"
-                _dist_pct     = abs(_lv_price - _cur_p) / (_cur_p + 1e-9) * 100
-                _meth_str     = "+".join(_lv_methods) if _lv_methods else ""
-                _ann          = (f"{'R' if _lv_type == 'resistance' else 'S'}"
-                                 f" ${_lv_price:.5f} ({_dist_pct:.1f}%)"
-                                 + (f" [{_meth_str}]" if _meth_str else ""))
-                fig.add_hline(
-                    y=_lv_price,
-                    line_color=_color,
-                    line_dash="dot",
-                    line_width=max(0.8, 1.5 * _lv_strength),
-                    opacity=_opacity,
-                    annotation_text=_ann,
-                    annotation_font_size=9,
-                    annotation_font_color=_color,
-                    row=1, col=1,
-                )
-            # Value area shading (70% of volume)
+            _x0     = ohlcv.index[0]
+            _x1     = ohlcv.index[-1]
+
+            # Value area shading first (behind lines)
             _va_lo = _sr.get("value_area_low")
             _va_hi = _sr.get("value_area_high")
             if _va_lo and _va_hi:
-                fig.add_hrect(
+                fig.add_shape(
+                    type="rect",
+                    x0=_x0, x1=_x1,
                     y0=_va_lo, y1=_va_hi,
-                    fillcolor="rgba(100,181,246,0.05)",
+                    xref="x", yref="y",
+                    fillcolor="rgba(100,181,246,0.07)",
                     line_width=0,
-                    annotation_text="Value Area (70% vol)",
-                    annotation_font_size=8,
-                    annotation_font_color="rgba(100,181,246,0.5)",
+                    layer="below",
+                    row=1, col=1,
+                )
+                fig.add_annotation(
+                    x=_x1, y=_va_hi,
+                    xref="x", yref="y",
+                    text="Value Area (70% vol)",
+                    showarrow=False,
+                    font=dict(size=8, color="rgba(100,181,246,0.6)"),
+                    xanchor="right", yanchor="bottom",
+                    row=1, col=1,
+                )
+
+            # S/R level lines + labels
+            for _lv in _levels:
+                _lv_price    = _lv.get("price", 0)
+                _lv_type     = _lv.get("type", "support")
+                _lv_strength = _lv.get("strength", 0.5)
+                _lv_methods  = _lv.get("methods", [])
+                _lv_touches  = _lv.get("touches", 0)
+                _dist_pct    = (_lv_price - _cur_p) / (_cur_p + 1e-9) * 100
+
+                # Color: bright for strong, muted for weak
+                if _lv_type == "resistance":
+                    _rgb = f"rgba(239,154,154,{0.4 + 0.5 * _lv_strength:.2f})"
+                else:
+                    _rgb = f"rgba(165,214,167,{0.4 + 0.5 * _lv_strength:.2f})"
+
+                _lw   = 0.8 + 1.4 * _lv_strength   # 0.8–2.2px
+                _dash = "solid" if _lv_strength >= 0.7 else "dot"
+
+                # Horizontal line
+                fig.add_shape(
+                    type="line",
+                    x0=_x0, x1=_x1,
+                    y0=_lv_price, y1=_lv_price,
+                    xref="x", yref="y",
+                    line=dict(color=_rgb, width=_lw, dash=_dash),
+                    row=1, col=1,
+                )
+
+                # Label at right edge
+                _prefix  = "R" if _lv_type == "resistance" else "S"
+                _meth_short = "+".join(
+                    m.replace("volume_node", "vol").replace("round_number", "rnd")
+                    for m in _lv_methods
+                )
+                _label = (f"{_prefix} ${_lv_price:.4f}  {_dist_pct:+.1f}%"
+                          + (f"  [{_meth_short}]" if _meth_short else "")
+                          + (f"  t={_lv_touches}" if _lv_touches else ""))
+                fig.add_annotation(
+                    x=_x1, y=_lv_price,
+                    xref="x", yref="y",
+                    text=_label,
+                    showarrow=False,
+                    font=dict(size=8, color=_rgb),
+                    bgcolor="rgba(15,20,30,0.65)",
+                    xanchor="right",
+                    yanchor="middle",
                     row=1, col=1,
                 )
 

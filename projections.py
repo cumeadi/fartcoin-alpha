@@ -25,7 +25,7 @@ except ImportError:
     _LGBM_AVAILABLE = False
 
 try:
-    from hmmlearn.hmm import GaussianHMM as _GaussianHMM
+    from hmm_engine import label_current as _hmm_label_current
     _HMM_AVAILABLE = True
 except ImportError:
     _HMM_AVAILABLE = False
@@ -2425,168 +2425,16 @@ def _detect_ghost_long(data):
 
 def _classify_hmm_regime(data, market_state):
     """
-    Hidden Markov Model — classifies the current market into one of 3 regimes:
-
-      State 0: STEADY_STATE    — Funding neutral, OI flat, avoid trading
-      State 1: ACCUMULATION    — Negative/low funding + rising OI + flat price (long bias)
-      State 2: HAKAI           — High VPIN proxy + OI spike + price breakout (exit/momentum)
-
-    A 0.4 composite in STEADY_STATE is noise.
-    A 0.4 composite in ACCUMULATION is a full-send signal.
-    A 0.4 composite in HAKAI means the move is ending — exit.
-
-    Returns dict with: regime, regime_label, confidence, conviction_multiplier, description
+    Delegates entirely to hmm_engine.label_current() — single source of truth.
     """
-    result = {
-        "regime": 1,
-        "regime_label": "STEADY_STATE",
-        "confidence": 0.0,
-        "conviction_multiplier": 1.0,
-        "description": "HMM: insufficient data.",
-        "available": False,
-    }
-
-    ohlcv   = data.get("ohlcv")
-    oi_df   = data.get("oi")
-    fund_df = data.get("funding")
-
-    if ohlcv is None or oi_df is None or fund_df is None:
-        return result
-    if len(ohlcv) < 48:
-        return result
-
-    try:
-        price_col = "price" if "price" in ohlcv.columns else "close"
-        oi_col    = oi_df.columns[0]
-        fund_col  = fund_df.columns[0]
-
-        # Build feature matrix on hourly resolution (last 500h for training)
-        n = min(500, len(ohlcv))
-        prices  = ohlcv[price_col].iloc[-n:].values.astype(float)
-        funding = fund_df[fund_col].iloc[-n:].values.astype(float)
-
-        # OI: align length
-        oi_vals = oi_df[oi_col].iloc[-n:].values.astype(float)
-        oi_vals = np.where(np.isnan(oi_vals), np.nanmean(oi_vals), oi_vals)
-
-        # Feature 1: Funding (normalised)
-        fund_z = (funding - np.nanmean(funding)) / (np.nanstd(funding) + 1e-9)
-
-        # Feature 2: OI 4h momentum (VPIN proxy — OI growth vs price growth)
-        oi_4h_chg  = np.diff(oi_vals, prepend=oi_vals[0]) / (np.abs(oi_vals) + 1e-9)
-        price_4h_chg = np.diff(prices, prepend=prices[0]) / (prices + 1e-9)
-        # Toxicity = OI rising without price (stealth accumulation) or OI spiking WITH price (hakai)
-        oi_z = (oi_4h_chg - np.nanmean(oi_4h_chg)) / (np.nanstd(oi_4h_chg) + 1e-9)
-        px_z = (price_4h_chg - np.nanmean(price_4h_chg)) / (np.nanstd(price_4h_chg) + 1e-9)
-
-        # Feature 3: Vol ratio (using OI accel as proxy since taker is synthetic)
-        vol = ohlcv["volume"].iloc[-n:].values.astype(float)
-        vol_rolling_mean = np.convolve(vol, np.ones(24)/24, mode="same")
-        vol_ratio = vol / (vol_rolling_mean + 1e-9)
-        vol_ratio_z = (vol_ratio - 1.0) / (np.nanstd(vol_ratio) + 1e-9)
-
-        X = np.column_stack([fund_z, oi_z, px_z, vol_ratio_z])
-        X = np.nan_to_num(X, nan=0.0)
-
-        # Train 3-state Gaussian HMM
-        model = _GaussianHMM(
-            n_components=3,
-            covariance_type="diag",
-            n_iter=100,
-            random_state=42,
-            tol=1e-3,
-        )
-        model.fit(X)
-
-        # Predict state sequence
-        states = model.predict(X)
-        posteriors = model.predict_proba(X)
-
-        # Map HMM states to economic regimes by their funding mean
-        # State with lowest mean funding → ACCUMULATION (shorts crowded / neutral)
-        # State with highest vol ratio → HAKAI
-        # Remainder → STEADY_STATE
-        state_fund_means = [fund_z[states == s].mean() if (states == s).any() else 0
-                            for s in range(3)]
-        state_vol_means  = [vol_ratio_z[states == s].mean() if (states == s).any() else 0
-                            for s in range(3)]
-        state_oi_means   = [oi_z[states == s].mean() if (states == s).any() else 0
-                            for s in range(3)]
-
-        # HAKAI = highest combined OI + vol activity
-        hakai_scores     = [state_vol_means[s] + state_oi_means[s] for s in range(3)]
-        hakai_state      = int(np.argmax(hakai_scores))
-
-        # ACCUMULATION = lowest funding (most negative / least positive)
-        accum_state      = int(np.argmin(state_fund_means))
-        if accum_state == hakai_state:
-            accum_state  = int(np.argsort(state_fund_means)[1])
-
-        # STEADY_STATE = the remaining one
-        remaining = [s for s in range(3) if s not in (hakai_state, accum_state)]
-        steady_state = remaining[0] if remaining else (3 - hakai_state - accum_state)
-
-        regime_map = {
-            hakai_state:  (2, "HAKAI"),
-            accum_state:  (1, "ACCUMULATION"),
-            steady_state: (0, "STEADY_STATE"),
+    if not _HMM_AVAILABLE:
+        return {
+            "regime": 0, "regime_label": "STEADY_STATE",
+            "confidence": 0.0, "conviction_multiplier": 0.5,
+            "hours_in_regime": 0, "description": "HMM unavailable.",
+            "available": False,
         }
-
-        current_state = int(states[-1])
-        regime_id, regime_label = regime_map.get(current_state, (0, "STEADY_STATE"))
-        confidence = float(posteriors[-1, current_state])
-
-        # Conviction multiplier: how much to scale the composite signal
-        # STEADY_STATE: 0.5x (composite of 0.4 is noise)
-        # ACCUMULATION: 1.5x (same composite is a full-send)
-        # HAKAI: 0.3x (exit phase — don't enter)
-        multipliers = {"STEADY_STATE": 0.5, "ACCUMULATION": 1.5, "HAKAI": 0.3}
-        conviction_mult = multipliers[regime_label]
-
-        # Hours in current state
-        hours_in = int(np.sum(np.diff(np.concatenate([[False], states == current_state, [False]])) < 0)
-                       if (states == current_state).any() else 0)
-        # Simpler: count trailing consecutive same state
-        trailing = 0
-        for s in reversed(states):
-            if s == current_state:
-                trailing += 1
-            else:
-                break
-
-        descriptions = {
-            "STEADY_STATE": (
-                f"HMM Regime: STEADY STATE (conf {confidence:.0%}, {trailing}h). "
-                f"Funding neutral, OI flat. Signal conviction halved — composite threshold raised. "
-                f"Avoid new positions unless composite >0.6."
-            ),
-            "ACCUMULATION": (
-                f"HMM Regime: ACCUMULATION 🟢 (conf {confidence:.0%}, {trailing}h). "
-                f"Low/negative funding + quiet OI build. Signal conviction 1.5x — "
-                f"composite of 0.4 is a full-send in this regime. Long bias."
-            ),
-            "HAKAI": (
-                f"HMM Regime: HAKAI ⚡ (conf {confidence:.0%}, {trailing}h). "
-                f"High VPIN proxy + OI spike + elevated vol. Distribution/exhaustion phase. "
-                f"Conviction 0.3x — if in a trade, tighten stops NOW. Do not enter new positions."
-            ),
-        }
-
-        result.update({
-            "regime": regime_id,
-            "regime_label": regime_label,
-            "confidence": round(confidence, 3),
-            "conviction_multiplier": conviction_mult,
-            "hours_in_regime": trailing,
-            "description": descriptions[regime_label],
-            "available": True,
-        })
-
-    except Exception as e:
-        result["description"] = f"HMM regime error: {e}"
-        result["available"] = False
-
-    return result
+    return _hmm_label_current(data, lookback=500)
 
 
 # =========================================================================

@@ -1217,12 +1217,18 @@ def fetch_coinglass_funding_snapshot(coin=DEFAULT_COIN):
         "binance_mins_to_settle": ex_mins_to_settle.get("Binance"),
     })
 
-    # Append to history CSV
+    # Append to history CSV — deduplicate within 30-minute windows to avoid
+    # identical rows from rapid successive runs
     row = {"timestamp": result["timestamp"], **{k: v for k, v in result.items() if k != "timestamp"}}
     df_row = pd.DataFrame([row])
     csv_path = DATA_DIR / "coinglass_funding_snapshot.csv"
     if csv_path.exists():
-        df_row.to_csv(csv_path, mode="a", header=False, index=False)
+        existing = pd.read_csv(csv_path, parse_dates=["timestamp"])
+        last_ts = pd.to_datetime(existing["timestamp"].iloc[-1], utc=True) if len(existing) else None
+        now_ts  = pd.to_datetime(result["timestamp"], utc=True)
+        # Only append if ≥30 min since last snapshot
+        if last_ts is None or (now_ts - last_ts).total_seconds() >= 1800:
+            df_row.to_csv(csv_path, mode="a", header=False, index=False)
     else:
         df_row.to_csv(csv_path, index=False)
 

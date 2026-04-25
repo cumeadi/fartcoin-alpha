@@ -50,12 +50,7 @@ try:
 except ImportError:
     _LGBM_OK = False
 
-try:
-    from hmmlearn.hmm import GaussianHMM
-    _HMM_OK = True
-except ImportError:
-    _HMM_OK = False
-
+from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_matrix as _hmm_features
 from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
 
@@ -63,7 +58,6 @@ CARRY_COST  = 0.0045   # 0.45% / 4h — Bybit floor
 TRAIN_WIN   = 400      # rolling training window in hours
 STEP        = 6        # walk-forward step size
 MIN_TRAIN   = 200      # minimum rows before first prediction
-HMM_STATES  = 3
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -72,66 +66,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature engineering
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _hmm_regime_series(fund_z, oi_z, px_z, vol_z, lookback=400):
-    """
-    Compute rolling HMM regime for each row.
-    Uses past `lookback` rows to train, then labels the current row.
-    Returns int array: 0=STEADY, 1=ACCUMULATION, 2=HAKAI
-    """
-    n = len(fund_z)
-    regimes = np.full(n, -1, dtype=int)
-
-    if not _HMM_OK:
-        return regimes
-
-    X = np.column_stack([fund_z, oi_z, px_z, vol_z])
-    X = np.nan_to_num(X, nan=0.0)
-
-    for i in range(lookback, n, STEP):
-        window = X[max(0, i - lookback): i]
-        try:
-            model = GaussianHMM(
-                n_components=HMM_STATES,
-                covariance_type="diag",
-                n_iter=80,
-                random_state=42,
-                tol=1e-2,
-            )
-            model.fit(window)
-            state_seq   = model.predict(window)
-            state_means = model.means_  # shape (n_states, n_features)
-
-            # Map states to economic regimes by feature profiles
-            # Feature 0 = fund_z: ACCUMULATION has lowest (most negative funding)
-            # Feature 2 = oi_z + feature 3 = vol_z: HAKAI has highest OI+vol
-            hakai_score = state_means[:, 1] + state_means[:, 3]   # oi_z + vol_z
-            hakai_s     = int(np.argmax(hakai_score))
-            accum_s     = int(np.argmin(state_means[:, 0]))        # lowest funding_z
-            if accum_s == hakai_s:
-                order   = np.argsort(state_means[:, 0])
-                accum_s = int(order[1] if order[0] == hakai_s else order[0])
-            steady_s    = [s for s in range(HMM_STATES) if s not in (hakai_s, accum_s)]
-            steady_s    = steady_s[0] if steady_s else (3 - hakai_s - accum_s)
-
-            regime_map  = {hakai_s: 2, accum_s: 1, steady_s: 0}
-
-            # Label the range [i-STEP, i)
-            last_states = model.predict(X[max(0, i - STEP): i])
-            for j, s in enumerate(last_states):
-                idx = i - STEP + j
-                if 0 <= idx < n:
-                    regimes[idx] = regime_map.get(int(s), 0)
-
-        except Exception:
-            continue
-
-    # Forward-fill any unlabeled rows
-    for i in range(n):
-        if regimes[i] == -1:
-            regimes[i] = regimes[i - 1] if i > 0 else 0
-
-    return regimes
 
 
 def build_meta_features(data):
@@ -155,8 +89,11 @@ def build_meta_features(data):
     fund_col  = fund_df.columns[0]
     lsr_col   = lsr_df.columns[0]
 
-    # ── Align everything to OHLCV index ─────────────────────────────────────
-    n = len(ohlcv)
+    # ── Align everything to shortest common length ───────────────────────────
+    btc_len = len(data.get("btc")) if data.get("btc") is not None and len(data.get("btc")) > 0 else len(ohlcv)
+    n = min(len(ohlcv), len(oi_df), len(fund_df), len(lsr_df), btc_len)
+
+    ohlcv   = ohlcv.iloc[:n]
     prices  = ohlcv[price_col].values.astype(float)
     funding = fund_df[fund_col].values[:n].astype(float)
     oi_vals = oi_df[oi_col].values[:n].astype(float)
@@ -224,10 +161,10 @@ def build_meta_features(data):
 
     # ── BTC lead-lag ─────────────────────────────────────────────────────────
     if btc_df is not None and len(btc_df) > 0:
-        btc_col   = "price" if "price" in btc_df.columns else btc_df.columns[0]
+        btc_col    = "price" if "price" in btc_df.columns else btc_df.columns[0]
         btc_prices = btc_df[btc_col].values[:n].astype(float)
-        btc_2h    = np.diff(btc_prices, prepend=btc_prices[0]) / (btc_prices + 1e-9)
-        df["btc_2h_ret"] = btc_2h
+        btc_2h     = np.diff(btc_prices, prepend=btc_prices[0]) / (btc_prices + 1e-9)
+        df["btc_2h_ret"] = btc_2h[:n]   # clip to n to handle length mismatches
     else:
         df["btc_2h_ret"] = 0.0
 
@@ -250,9 +187,11 @@ def build_meta_features(data):
                   np.where((hours >= 17) & (hours < 22), 3, 0)))
     df["session_enc"] = session_enc
 
-    # ── HMM regime (walk-forward, no lookahead) ───────────────────────────────
-    print("  [meta] Computing rolling HMM regime labels...", flush=True)
-    regimes = _hmm_regime_series(fund_z, oi_z, px_z, vol_z, lookback=TRAIN_WIN)
+    # ── HMM regime (walk-forward via hmm_engine — single source of truth) ───────
+    print("  [meta] Computing rolling HMM regime labels (hmm_engine)...", flush=True)
+    # Pass a sliced copy so hmm_engine sees the same n rows as df
+    data_n = {k: (v.iloc[:n] if hasattr(v, "iloc") else v) for k, v in data.items()}
+    regimes = _roll_regime_series(data_n, lookback=TRAIN_WIN, step=STEP)[:n]
     df["hmm_regime"]   = regimes
     df["hmm_hakai"]    = (regimes == 2).astype(float)
     df["hmm_accum"]    = (regimes == 1).astype(float)
@@ -337,15 +276,21 @@ def walk_forward_meta(df):
             X_test = row[available_features].values.reshape(1, -1)
             prob   = float(model.predict_proba(X_test)[0, 1])
 
+            # ── Fix 2: Hard HAKAI gate ────────────────────────────────────
+            # HAKAI = distribution phase. No new entries regardless of model prob.
+            # Force meta_trade=0 for all HAKAI rows — the model should not trade here.
+            is_hakai   = int(row["hmm_hakai"] > 0.5)
+            meta_trade = int(prob > 0.55 and not is_hakai)
+
             results.append({
                 "timestamp":  df.index[i],
                 "fwd_ret_4h": float(row["fwd_ret_4h"]),
                 "target_4h":  int(row["target_4h"]),
                 "meta_prob":  prob,
-                "meta_hit":   int(prob > 0.55 and row["fwd_ret_4h"] > CARRY_COST),
-                "meta_trade": int(prob > 0.55),
+                "meta_hit":   int(meta_trade and row["fwd_ret_4h"] > CARRY_COST),
+                "meta_trade": meta_trade,
                 "hmm_regime": int(row["hmm_regime"]),
-                "is_hakai":   int(row["hmm_hakai"] > 0.5),
+                "is_hakai":   is_hakai,
                 "is_accum":   int(row["hmm_accum"] > 0.5),
                 "vpin_z":     float(row["vpin_z"]),
                 "composite":  float(row["composite"]),
@@ -529,12 +474,12 @@ def score_results(results, coin):
 
 
 def plot_results(results, coin):
-    """Rolling hit rate, cumulative PnL, regime overlay."""
+    """Rolling hit rate, cumulative PnL, regime overlay, calibration curve."""
     if len(results) < 20:
         return
 
-    fig = plt.figure(figsize=(14, 10))
-    gs  = gridspec.GridSpec(3, 1, hspace=0.4)
+    fig = plt.figure(figsize=(14, 14))
+    gs  = gridspec.GridSpec(4, 1, hspace=0.45)
 
     timestamps = pd.to_datetime(results["timestamp"])
     trade_mask = results["meta_trade"] == 1
@@ -587,6 +532,42 @@ def plot_results(results, coin):
     ax3.legend(fontsize=8)
     ax3.set_facecolor("#1a1a2e")
     ax3.tick_params(colors="white"); ax3.yaxis.label.set_color("white"); ax3.title.set_color("white")
+
+    # ── Panel 4: Calibration curve ────────────────────────────────────────────
+    # "Does a 60% meta_prob actually hit 60% of the time?"
+    ax4 = fig.add_subplot(gs[3])
+    n_bins = 10
+    bins   = np.linspace(0, 1, n_bins + 1)
+    bin_mid, frac_pos, bin_counts = [], [], []
+
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (results["meta_prob"] >= lo) & (results["meta_prob"] < hi)
+        if mask.sum() >= 3:
+            actual_hit = (results.loc[mask, "fwd_ret_4h"] > CARRY_COST).mean()
+            bin_mid.append((lo + hi) / 2)
+            frac_pos.append(actual_hit)
+            bin_counts.append(mask.sum())
+
+    if bin_mid:
+        ax4.plot([0, 1], [0, 1], color="#888888", linestyle="--", alpha=0.5, label="Perfect calibration")
+        ax4.plot(bin_mid, frac_pos, color="#00d4aa", marker="o", linewidth=1.5,
+                 markersize=5, label="Actual hit rate")
+        # Size points by sample count
+        for bm, fp, bc in zip(bin_mid, frac_pos, bin_counts):
+            ax4.annotate(f"n={bc}", (bm, fp), textcoords="offset points",
+                        xytext=(4, 4), fontsize=6, color="#888888")
+        ax4.axhline(0.55, color="white", linestyle=":", alpha=0.4, label="Entry threshold")
+        ax4.fill_between([0, 1], [0, 0], [0.55, 0.55], alpha=0.08, color="#ff6b6b")
+        ax4.fill_between([0, 1], [0.55, 0.55], [1, 1], alpha=0.08, color="#00d4aa")
+
+    ax4.set_xlim(0, 1); ax4.set_ylim(0, 1)
+    ax4.set_xlabel("Predicted probability", color="white")
+    ax4.set_ylabel("Actual hit rate", color="white")
+    ax4.set_title(f"{coin} — Calibration Curve (predicted vs actual hit rate)")
+    ax4.legend(fontsize=8)
+    ax4.set_facecolor("#1a1a2e")
+    ax4.tick_params(colors="white"); ax4.xaxis.label.set_color("white")
+    ax4.yaxis.label.set_color("white"); ax4.title.set_color("white")
 
     fig.patch.set_facecolor("#0d0d1a")
     out = OUTPUT_DIR / f"meta_model_{coin}.png"

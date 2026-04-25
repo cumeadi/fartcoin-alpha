@@ -43,6 +43,9 @@ def run_pipeline(mode="light", coin=DEFAULT_COIN):
     if mode == "full":
         print("Collecting all data...", file=sys.stderr)
         collect_all(cmc_symbol=cmc_sym, perp_symbol=perp_sym, cg_coin_id=cg_id)
+    elif mode == "snapshot":
+        print("Snapshot mode — skipping OHLCV refresh, using cached data...", file=sys.stderr)
+        # No data collection — only external snapshot collectors ran above
     else:
         print("Light poll (derivatives snapshot)...", file=sys.stderr)
         poll_once(coin_filter=cmc_sym)
@@ -104,8 +107,9 @@ def run_pipeline(mode="light", coin=DEFAULT_COIN):
 
 def main():
     parser = argparse.ArgumentParser(description="Fartcoin Alpha Automation Pipeline")
-    parser.add_argument("--mode", choices=["light", "full"], default="light",
-                        help="light = poll_once + signals; full = collect_all + signals")
+    parser.add_argument("--mode", choices=["light", "full", "snapshot"], default="light",
+                        help="light = poll_once + signals; full = collect_all + signals; "
+                             "snapshot = coinglass funding + OI only (fast, for Ghost Long data)")
     parser.add_argument("--external", action="store_true",
                         help="Also run external collectors (CryptoPanic, Helius, Coinalyze)")
     parser.add_argument("--coin", default=DEFAULT_COIN,
@@ -117,6 +121,12 @@ def main():
         print("Running external collectors...", file=sys.stderr)
         if args.mode == "full":
             collect_all_external(coin=args.coin)
+        elif args.mode == "snapshot":
+            # Lightweight: just funding + OI snapshots for Ghost Long accumulation
+            from external_collectors import fetch_coinglass_funding_snapshot, fetch_coinglass_oi_snapshot
+            print(f"  [snapshot] Collecting Coinglass funding + OI for {args.coin}...", file=sys.stderr)
+            fetch_coinglass_funding_snapshot(coin=args.coin)
+            fetch_coinglass_oi_snapshot(coin=args.coin)
         else:
             collect_light_external(coin=args.coin)
 

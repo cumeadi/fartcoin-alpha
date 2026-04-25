@@ -3,14 +3,69 @@ Alert Engine — Fartcoin Alpha Framework
 
 Evaluates alert rules against current market state and manages cooldowns
 to prevent duplicate notifications.
+
+Volatility-adjusted cooldowns: when ATR is spiking, manipulation cycles
+accelerate — cooldowns shorten automatically so we don't miss fast-moving
+alerts. When vol is low, cooldowns lengthen to avoid noise.
 """
 
 import json
+import numpy as np
+import pandas as pd
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent / "data"
 STATE_FILE = DATA_DIR / "alert_state.json"
+
+# Cached ATR multiplier — recomputed each pipeline run
+_VOL_COOLDOWN_MULTIPLIER = 1.0
+
+
+def compute_atr_cooldown_multiplier(ohlcv_df, period=14):
+    """
+    Compute a volatility-based cooldown multiplier from ATR.
+
+    Low vol  (ATR < p25): multiply cooldown by 1.5x (fewer alerts, wait longer)
+    Normal   (ATR p25-p75): 1.0x (standard cooldown)
+    High vol (ATR > p75): multiply by 0.5x (more frequent alerts — cycles accelerating)
+    Extreme  (ATR > p90): multiply by 0.25x (very fast cycle — alert nearly every run)
+
+    Returns: float multiplier
+    """
+    global _VOL_COOLDOWN_MULTIPLIER
+    try:
+        if ohlcv_df is None or len(ohlcv_df) < period + 2:
+            return 1.0
+
+        price_col = "price" if "price" in ohlcv_df.columns else "close"
+        prices = ohlcv_df[price_col].values.astype(float)
+
+        # ATR using hourly close-to-close as proxy (no H/L in snapshot data)
+        returns = np.abs(np.diff(prices)) / (prices[:-1] + 1e-9)
+        atr_series = pd.Series(returns).rolling(period).mean().dropna().values
+
+        if len(atr_series) < 10:
+            return 1.0
+
+        atr_now = atr_series[-1]
+        p25 = np.percentile(atr_series, 25)
+        p75 = np.percentile(atr_series, 75)
+        p90 = np.percentile(atr_series, 90)
+
+        if atr_now > p90:
+            mult = 0.25   # extreme vol — cycles very fast
+        elif atr_now > p75:
+            mult = 0.5    # high vol — shorten cooldowns
+        elif atr_now < p25:
+            mult = 1.5    # low vol — lengthen cooldowns
+        else:
+            mult = 1.0
+
+        _VOL_COOLDOWN_MULTIPLIER = mult
+        return mult
+    except Exception:
+        return 1.0
 
 
 def _load_cooldowns():
@@ -23,12 +78,15 @@ def _save_cooldowns(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _is_cooled_down(state, rule_name, cooldown_hours):
+def _is_cooled_down(state, rule_name, cooldown_hours, vol_adjust=True):
+    """Check if enough time has passed since last fire, with optional vol scaling."""
     last_fired = state.get(rule_name)
     if last_fired is None:
         return True
     last_dt = datetime.fromisoformat(last_fired)
-    return datetime.now(timezone.utc) - last_dt > timedelta(hours=cooldown_hours)
+    effective_hours = cooldown_hours * (_VOL_COOLDOWN_MULTIPLIER if vol_adjust else 1.0)
+    effective_hours = max(0.5, effective_hours)   # floor at 30min
+    return datetime.now(timezone.utc) - last_dt > timedelta(hours=effective_hours)
 
 
 def _fire(state, rule_name):
@@ -394,6 +452,50 @@ def evaluate_projection_alerts(projections, market_state):
             "message": msg,
         })
         _fire(state, "proj_settlement_cycle")
+
+    # --- Rule P10b: Ghost Long / Informed Bearish ---
+    ghost = projections.get("ghost_long", {})
+    if ghost.get("bearish_signal") and _is_cooled_down(state, "proj_ghost_long", 4):
+        msg = (
+            f"*GHOST LONG DETECTED*\n\n"
+            f"*State:* {ghost.get('state', 'N/A')}\n"
+            f"*Spread (Binance - Bybit):* {ghost.get('spread_now', 0):+.3f}%\n"
+            f"*Velocity Z-Score:* {ghost.get('velocity_zscore', 0):+.1f}σ\n\n"
+            f"{ghost.get('description', '')}\n\n"
+            f"MMs absorbing Bybit sell pressure to keep carry alive. "
+            f"High-probability FLUSH — fade any longs."
+        )
+        alerts.append({
+            "type": "proj_ghost_long",
+            "severity": "high",
+            "title": f"Ghost Long: {ghost.get('state')} — Flush risk",
+            "message": msg,
+        })
+        _fire(state, "proj_ghost_long")
+
+    # --- Rule P10c: HMM Regime Change ---
+    hmm = projections.get("hmm_regime", {})
+    if hmm.get("available"):
+        prev_regime = state.get("last_hmm_regime", "STEADY_STATE")
+        curr_regime = hmm.get("regime_label", "STEADY_STATE")
+        if curr_regime != prev_regime and _is_cooled_down(state, "proj_hmm_regime", 3, vol_adjust=False):
+            emoji = {"HAKAI": "⚡", "ACCUMULATION": "🟢", "STEADY_STATE": "😴"}.get(curr_regime, "")
+            msg = (
+                f"*HMM REGIME CHANGE {emoji}*\n\n"
+                f"*Previous:* {prev_regime}\n"
+                f"*Current:* {curr_regime} (conf: {hmm.get('confidence', 0):.0%})\n"
+                f"*Conviction Multiplier:* {hmm.get('conviction_multiplier', 1.0):.1f}x\n\n"
+                f"{hmm.get('description', '')}"
+            )
+            alerts.append({
+                "type": "proj_hmm_regime",
+                "severity": "high" if curr_regime == "HAKAI" else "medium",
+                "title": f"Regime → {curr_regime} {emoji}",
+                "message": msg,
+            })
+            _fire(state, "proj_hmm_regime")
+        # Store current regime for next comparison
+        state["last_hmm_regime"] = curr_regime
 
     # --- Rule P10: Liquidation Cascade entry window ---
     liq_cas = projections.get("liq_cascade", {})

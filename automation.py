@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data_collector import poll_once, collect_all
 from signal_engine import load_data, compute_all_signals
 from market_state import compute_market_state, determine_action
-from alerts import evaluate_alerts, evaluate_projection_alerts
+from alerts import evaluate_alerts, evaluate_projection_alerts, compute_atr_cooldown_multiplier
 from projections import compute_projections
 from coin_config import get_config, DEFAULT_COIN
 try:
@@ -62,6 +62,9 @@ def run_pipeline(mode="light", coin=DEFAULT_COIN):
     # Step 4: Compute market state + action
     mkt = compute_market_state(data)
     action = determine_action(mkt)
+
+    # Step 4b: Calibrate vol-adjusted cooldown multiplier from ATR
+    compute_atr_cooldown_multiplier(data.get("ohlcv"))
 
     # Step 5: Evaluate alerts
     triggered_alerts = evaluate_alerts(mkt, action)

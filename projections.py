@@ -1,8 +1,16 @@
 """
 Forward Projection Engine — Fartcoin Alpha Framework
 
-6 projection sub-models that transform reactive signals into forward-looking
-intelligence. Pure Python + pandas + numpy + scipy — no ML libraries.
+Sub-models:
+  1. Probabilistic Forward Returns (LightGBM)
+  2. Mean Reversion (funding + LSR)
+  3. Manipulation Cycle Detector
+  4. Session Conditional
+  5. BTC Lead-Lag
+  6. Confidence Intervals
+  7. Ghost Long Detector  ← NEW: Binance/Bybit funding velocity divergence
+  8. HMM Regime Switcher  ← NEW: 3-state hidden Markov regime classifier
+  9. VPIN Proxy           ← NEW: OI-based informed-flow toxicity
 
 Entry point: compute_projections(data, market_state) -> dict
 """
@@ -15,6 +23,12 @@ try:
     _LGBM_AVAILABLE = True
 except ImportError:
     _LGBM_AVAILABLE = False
+
+try:
+    from hmmlearn.hmm import GaussianHMM as _GaussianHMM
+    _HMM_AVAILABLE = True
+except ImportError:
+    _HMM_AVAILABLE = False
 from datetime import datetime, timezone
 
 from market_state import (
@@ -2298,6 +2312,390 @@ def _compute_trade_setups(prob, mr, session, btc, settlement, cg_oi_fund, liq_ca
 
 
 # =========================================================================
+# 7. Ghost Long Detector — Funding Velocity Cross-Venue Divergence
+# =========================================================================
+
+def _detect_ghost_long(data):
+    """
+    Ghost Long: Binance funding rate collapsing while Bybit stays pinned at floor.
+    MMs absorb sell pressure on Bybit to keep the carry trade alive, then flush.
+
+    Signal: ΔF_mom = ∂/∂t(F_Binance - F_Bybit)
+    If the spread velocity is sharply negative (Binance leading lower while Bybit
+    stays elevated), longs on Bybit are the bag-holders.
+
+    Returns dict with keys:
+      state, spread_now, spread_velocity, velocity_zscore, description
+    """
+    result = {
+        "state": "NORMAL",
+        "spread_now": None,
+        "spread_velocity": None,
+        "velocity_zscore": None,
+        "description": "Cross-venue funding velocity: no data.",
+        "bearish_signal": False,
+    }
+
+    fund_snap = data.get("coinglass_funding")
+    if fund_snap is None or len(fund_snap) < 4:
+        return result
+
+    try:
+        df = fund_snap.copy().sort_values("timestamp")
+        # Require both Binance and Bybit columns
+        if "binance_rate" not in df.columns or "bybit_rate" not in df.columns:
+            return result
+
+        df = df.dropna(subset=["binance_rate", "bybit_rate"])
+        if len(df) < 3:
+            return result
+
+        # Spread: Binance - Bybit (positive = Binance more bullish)
+        df["spread"] = df["binance_rate"] - df["bybit_rate"]
+
+        # Velocity: first difference of spread (change per snapshot interval)
+        df["spread_vel"] = df["spread"].diff()
+
+        spread_now  = float(df["spread"].iloc[-1])
+        vel_now     = float(df["spread_vel"].iloc[-1])
+
+        # Z-score velocity relative to history
+        vel_std = df["spread_vel"].std()
+        vel_zscore = (vel_now / vel_std) if vel_std > 1e-9 else 0.0
+
+        result["spread_now"]       = round(spread_now, 4)
+        result["spread_velocity"]  = round(vel_now, 4)
+        result["velocity_zscore"]  = round(vel_zscore, 2)
+
+        bybit_rate_now    = float(df["bybit_rate"].iloc[-1])
+        binance_rate_now  = float(df["binance_rate"].iloc[-1])
+
+        # Ghost Long conditions:
+        # 1. Bybit at/near floor (≥ +0.40%) but Binance collapsing (rate falling fast)
+        # 2. Spread velocity is sharply negative (Binance leading lower)
+        bybit_elevated  = bybit_rate_now >= 0.40
+        binance_falling = vel_zscore < -1.5
+        spread_negative = spread_now < -0.20   # Binance already below Bybit — informed bearish
+
+        if bybit_elevated and binance_falling:
+            result["state"] = "GHOST_LONG"
+            result["bearish_signal"] = True
+            result["description"] = (
+                f"⚠ GHOST LONG: Bybit pinned at {bybit_rate_now:+.3f}% while Binance "
+                f"funding collapsing (vel {vel_now:+.4f}, {vel_zscore:+.1f}σ). "
+                f"MMs absorbing sell pressure on Bybit to keep carry trade alive. "
+                f"High-probability FLUSH signal — fade longs."
+            )
+        elif spread_negative and vel_zscore < -1.0:
+            result["state"] = "INFORMED_BEARISH"
+            result["bearish_signal"] = True
+            result["description"] = (
+                f"Binance leading lower: spread {spread_now:+.3f}% "
+                f"(Binance {binance_rate_now:+.3f}% vs Bybit {bybit_rate_now:+.3f}%). "
+                f"Informed venue bearish vs retail venue. Velocity {vel_zscore:+.1f}σ."
+            )
+        elif vel_zscore > 1.5 and spread_now > 0.20:
+            result["state"] = "INFORMED_BULLISH"
+            result["description"] = (
+                f"Binance funding accelerating higher vs Bybit: spread {spread_now:+.3f}%, "
+                f"velocity {vel_zscore:+.1f}σ. Informed venue bullish."
+            )
+        else:
+            result["state"] = "NORMAL"
+            result["description"] = (
+                f"Cross-venue funding velocity normal. "
+                f"Spread: {spread_now:+.3f}% (Binance {binance_rate_now:+.3f}% "
+                f"vs Bybit {bybit_rate_now:+.3f}%). Velocity: {vel_zscore:+.1f}σ."
+            )
+    except Exception as e:
+        result["description"] = f"Ghost Long detector error: {e}"
+
+    return result
+
+
+# =========================================================================
+# 8. HMM Regime Switcher — 3-State Market Regime Classifier
+# =========================================================================
+
+def _classify_hmm_regime(data, market_state):
+    """
+    Hidden Markov Model — classifies the current market into one of 3 regimes:
+
+      State 0: STEADY_STATE    — Funding neutral, OI flat, avoid trading
+      State 1: ACCUMULATION    — Negative/low funding + rising OI + flat price (long bias)
+      State 2: HAKAI           — High VPIN proxy + OI spike + price breakout (exit/momentum)
+
+    A 0.4 composite in STEADY_STATE is noise.
+    A 0.4 composite in ACCUMULATION is a full-send signal.
+    A 0.4 composite in HAKAI means the move is ending — exit.
+
+    Returns dict with: regime, regime_label, confidence, conviction_multiplier, description
+    """
+    result = {
+        "regime": 1,
+        "regime_label": "STEADY_STATE",
+        "confidence": 0.0,
+        "conviction_multiplier": 1.0,
+        "description": "HMM: insufficient data.",
+        "available": False,
+    }
+
+    ohlcv   = data.get("ohlcv")
+    oi_df   = data.get("oi")
+    fund_df = data.get("funding")
+
+    if ohlcv is None or oi_df is None or fund_df is None:
+        return result
+    if len(ohlcv) < 48:
+        return result
+
+    try:
+        price_col = "price" if "price" in ohlcv.columns else "close"
+        oi_col    = oi_df.columns[0]
+        fund_col  = fund_df.columns[0]
+
+        # Build feature matrix on hourly resolution (last 500h for training)
+        n = min(500, len(ohlcv))
+        prices  = ohlcv[price_col].iloc[-n:].values.astype(float)
+        funding = fund_df[fund_col].iloc[-n:].values.astype(float)
+
+        # OI: align length
+        oi_vals = oi_df[oi_col].iloc[-n:].values.astype(float)
+        oi_vals = np.where(np.isnan(oi_vals), np.nanmean(oi_vals), oi_vals)
+
+        # Feature 1: Funding (normalised)
+        fund_z = (funding - np.nanmean(funding)) / (np.nanstd(funding) + 1e-9)
+
+        # Feature 2: OI 4h momentum (VPIN proxy — OI growth vs price growth)
+        oi_4h_chg  = np.diff(oi_vals, prepend=oi_vals[0]) / (np.abs(oi_vals) + 1e-9)
+        price_4h_chg = np.diff(prices, prepend=prices[0]) / (prices + 1e-9)
+        # Toxicity = OI rising without price (stealth accumulation) or OI spiking WITH price (hakai)
+        oi_z = (oi_4h_chg - np.nanmean(oi_4h_chg)) / (np.nanstd(oi_4h_chg) + 1e-9)
+        px_z = (price_4h_chg - np.nanmean(price_4h_chg)) / (np.nanstd(price_4h_chg) + 1e-9)
+
+        # Feature 3: Vol ratio (using OI accel as proxy since taker is synthetic)
+        vol = ohlcv["volume"].iloc[-n:].values.astype(float)
+        vol_rolling_mean = np.convolve(vol, np.ones(24)/24, mode="same")
+        vol_ratio = vol / (vol_rolling_mean + 1e-9)
+        vol_ratio_z = (vol_ratio - 1.0) / (np.nanstd(vol_ratio) + 1e-9)
+
+        X = np.column_stack([fund_z, oi_z, px_z, vol_ratio_z])
+        X = np.nan_to_num(X, nan=0.0)
+
+        # Train 3-state Gaussian HMM
+        model = _GaussianHMM(
+            n_components=3,
+            covariance_type="diag",
+            n_iter=100,
+            random_state=42,
+            tol=1e-3,
+        )
+        model.fit(X)
+
+        # Predict state sequence
+        states = model.predict(X)
+        posteriors = model.predict_proba(X)
+
+        # Map HMM states to economic regimes by their funding mean
+        # State with lowest mean funding → ACCUMULATION (shorts crowded / neutral)
+        # State with highest vol ratio → HAKAI
+        # Remainder → STEADY_STATE
+        state_fund_means = [fund_z[states == s].mean() if (states == s).any() else 0
+                            for s in range(3)]
+        state_vol_means  = [vol_ratio_z[states == s].mean() if (states == s).any() else 0
+                            for s in range(3)]
+        state_oi_means   = [oi_z[states == s].mean() if (states == s).any() else 0
+                            for s in range(3)]
+
+        # HAKAI = highest combined OI + vol activity
+        hakai_scores     = [state_vol_means[s] + state_oi_means[s] for s in range(3)]
+        hakai_state      = int(np.argmax(hakai_scores))
+
+        # ACCUMULATION = lowest funding (most negative / least positive)
+        accum_state      = int(np.argmin(state_fund_means))
+        if accum_state == hakai_state:
+            accum_state  = int(np.argsort(state_fund_means)[1])
+
+        # STEADY_STATE = the remaining one
+        remaining = [s for s in range(3) if s not in (hakai_state, accum_state)]
+        steady_state = remaining[0] if remaining else (3 - hakai_state - accum_state)
+
+        regime_map = {
+            hakai_state:  (2, "HAKAI"),
+            accum_state:  (1, "ACCUMULATION"),
+            steady_state: (0, "STEADY_STATE"),
+        }
+
+        current_state = int(states[-1])
+        regime_id, regime_label = regime_map.get(current_state, (0, "STEADY_STATE"))
+        confidence = float(posteriors[-1, current_state])
+
+        # Conviction multiplier: how much to scale the composite signal
+        # STEADY_STATE: 0.5x (composite of 0.4 is noise)
+        # ACCUMULATION: 1.5x (same composite is a full-send)
+        # HAKAI: 0.3x (exit phase — don't enter)
+        multipliers = {"STEADY_STATE": 0.5, "ACCUMULATION": 1.5, "HAKAI": 0.3}
+        conviction_mult = multipliers[regime_label]
+
+        # Hours in current state
+        hours_in = int(np.sum(np.diff(np.concatenate([[False], states == current_state, [False]])) < 0)
+                       if (states == current_state).any() else 0)
+        # Simpler: count trailing consecutive same state
+        trailing = 0
+        for s in reversed(states):
+            if s == current_state:
+                trailing += 1
+            else:
+                break
+
+        descriptions = {
+            "STEADY_STATE": (
+                f"HMM Regime: STEADY STATE (conf {confidence:.0%}, {trailing}h). "
+                f"Funding neutral, OI flat. Signal conviction halved — composite threshold raised. "
+                f"Avoid new positions unless composite >0.6."
+            ),
+            "ACCUMULATION": (
+                f"HMM Regime: ACCUMULATION 🟢 (conf {confidence:.0%}, {trailing}h). "
+                f"Low/negative funding + quiet OI build. Signal conviction 1.5x — "
+                f"composite of 0.4 is a full-send in this regime. Long bias."
+            ),
+            "HAKAI": (
+                f"HMM Regime: HAKAI ⚡ (conf {confidence:.0%}, {trailing}h). "
+                f"High VPIN proxy + OI spike + elevated vol. Distribution/exhaustion phase. "
+                f"Conviction 0.3x — if in a trade, tighten stops NOW. Do not enter new positions."
+            ),
+        }
+
+        result.update({
+            "regime": regime_id,
+            "regime_label": regime_label,
+            "confidence": round(confidence, 3),
+            "conviction_multiplier": conviction_mult,
+            "hours_in_regime": trailing,
+            "description": descriptions[regime_label],
+            "available": True,
+        })
+
+    except Exception as e:
+        result["description"] = f"HMM regime error: {e}"
+        result["available"] = False
+
+    return result
+
+
+# =========================================================================
+# 9. VPIN Proxy — OI-Based Informed Flow Toxicity
+# =========================================================================
+
+def _compute_vpin_proxy(data):
+    """
+    True VPIN requires tick-level buy/sell volume. Since our taker data is synthetic,
+    we compute an OI-based informed-flow toxicity proxy:
+
+      OI imbalance (rising OI + no price move) = stealth accumulation (toxic long)
+      OI collapse + price spike = distribution (hakai end-of-move)
+      OI + price co-moving = trend (less toxic — directional)
+
+    VPIN_proxy = |OI_pct_change| * (1 - |price_OI_correlation|)
+    High values = OI moving without price = informed positioning (toxic flow)
+
+    Returns dict with: vpin_proxy, vpin_zscore, toxicity, description
+    """
+    result = {
+        "vpin_proxy": None,
+        "vpin_zscore": None,
+        "toxicity": "NORMAL",
+        "description": "VPIN proxy: insufficient data.",
+        "available": False,
+    }
+
+    ohlcv = data.get("ohlcv")
+    oi_df = data.get("oi")
+
+    if ohlcv is None or oi_df is None or len(ohlcv) < 24:
+        return result
+
+    try:
+        price_col = "price" if "price" in ohlcv.columns else "close"
+        oi_col    = oi_df.columns[0]
+
+        n = min(200, len(ohlcv), len(oi_df))
+        prices  = ohlcv[price_col].iloc[-n:].values.astype(float)
+        oi_vals = oi_df[oi_col].iloc[-n:].values.astype(float)
+
+        # Bucket-based VPIN proxy over 8-hour volume buckets
+        bucket = 8
+        vpin_series = []
+        for i in range(bucket, n):
+            price_bucket = prices[i-bucket:i]
+            oi_bucket    = oi_vals[i-bucket:i]
+
+            price_ret = np.diff(price_bucket) / (price_bucket[:-1] + 1e-9)
+            oi_ret    = np.diff(oi_bucket)    / (np.abs(oi_bucket[:-1]) + 1e-9)
+
+            if len(price_ret) < 2:
+                continue
+
+            # Imbalance: |OI change| weighted by inverse price-OI correlation
+            corr = np.corrcoef(price_ret, oi_ret)[0, 1] if len(price_ret) > 1 else 0.0
+            corr = 0.0 if np.isnan(corr) else corr
+
+            # High |OI_ret| with low |corr| = toxic (OI moving without price explanation)
+            vpin_val = np.mean(np.abs(oi_ret)) * (1.0 - abs(corr))
+            vpin_series.append(vpin_val)
+
+        if len(vpin_series) < 5:
+            return result
+
+        vpin_arr  = np.array(vpin_series)
+        vpin_now  = vpin_arr[-1]
+        vpin_mean = vpin_arr.mean()
+        vpin_std  = vpin_arr.std() + 1e-9
+        vpin_z    = (vpin_now - vpin_mean) / vpin_std
+
+        # Classify toxicity
+        if vpin_z > 2.0:
+            toxicity = "EXTREME"
+            desc = (
+                f"⚠ EXTREME TOXIC FLOW: VPIN proxy {vpin_now:.4f} (+{vpin_z:.1f}σ). "
+                f"OI moving sharply without price correlation — informed MMs positioning "
+                f"before a stop-hunt. Treat any Dormant/Buildup signal as HIGH PRIORITY."
+            )
+        elif vpin_z > 1.0:
+            toxicity = "ELEVATED"
+            desc = (
+                f"ELEVATED TOXIC FLOW: VPIN proxy {vpin_now:.4f} (+{vpin_z:.1f}σ). "
+                f"Above-average OI imbalance vs price. MMs may be filling bags. "
+                f"A Buildup signal here has higher conversion probability."
+            )
+        elif vpin_z < -1.0:
+            toxicity = "LOW"
+            desc = (
+                f"Low toxic flow: VPIN proxy {vpin_now:.4f} ({vpin_z:.1f}σ). "
+                f"OI and price moving together — directional, less manipulated."
+            )
+        else:
+            toxicity = "NORMAL"
+            desc = (
+                f"VPIN proxy normal: {vpin_now:.4f} ({vpin_z:+.1f}σ). "
+                f"No unusual informed-flow activity."
+            )
+
+        result.update({
+            "vpin_proxy": round(float(vpin_now), 6),
+            "vpin_zscore": round(float(vpin_z), 2),
+            "toxicity": toxicity,
+            "description": desc,
+            "available": True,
+        })
+
+    except Exception as e:
+        result["description"] = f"VPIN proxy error: {e}"
+
+    return result
+
+
+# =========================================================================
 
 def compute_projections(data, market_state):
     """
@@ -2316,6 +2714,51 @@ def compute_projections(data, market_state):
     cycle = _detect_hourly_manipulation_cycle(data, market_state)
     session = _project_session_conditional(data, market_state)
     btc = _project_btc_lead_lag(data, market_state)
+
+    # ── New structural intelligence models ────────────────────────────────
+    ghost_long = _detect_ghost_long(data)
+    hmm_regime = _classify_hmm_regime(data, market_state)
+    vpin       = _compute_vpin_proxy(data)
+
+    # ── HMM regime adjusts conviction on probability model ───────────────
+    # In HAKAI regime, suppress entries regardless of composite score.
+    # In ACCUMULATION, amplify signal conviction.
+    # In STEADY_STATE, raise the bar (require stronger composite).
+    if hmm_regime["available"]:
+        regime_label = hmm_regime["regime_label"]
+        mult = hmm_regime["conviction_multiplier"]
+        raw_prob = prob["prob_positive_4h"]
+        if regime_label == "HAKAI":
+            # Distribution phase — clamp probability toward 0.5 (no edge)
+            prob["prob_positive_4h"] = 0.5 + (raw_prob - 0.5) * mult
+            prob["description"] += f" [HMM HAKAI: conviction {mult}x — exit phase, no new entries]"
+        elif regime_label == "ACCUMULATION":
+            # Amplify signal strength
+            prob["prob_positive_4h"] = 0.5 + (raw_prob - 0.5) * mult
+            prob["prob_positive_4h"] = min(max(prob["prob_positive_4h"], 0.0), 1.0)
+            prob["description"] += f" [HMM ACCUMULATION: conviction {mult}x — full-send regime]"
+        elif regime_label == "STEADY_STATE":
+            # Compress signal — only very strong signals matter
+            prob["prob_positive_4h"] = 0.5 + (raw_prob - 0.5) * mult
+            prob["description"] += f" [HMM STEADY STATE: conviction {mult}x — raise bar to 0.60+]"
+
+    # ── Ghost Long upgrades bearish conviction ────────────────────────────
+    if ghost_long.get("bearish_signal"):
+        current_p = prob["prob_positive_4h"]
+        if current_p > 0.45:  # Only suppress if model wasn't already bearish
+            prob["prob_positive_4h"] = min(current_p, 0.42)
+            prob["description"] += (
+                f" [GHOST LONG OVERRIDE: Bybit/Binance velocity divergence → "
+                f"bearish. Fade longs.]"
+            )
+
+    # ── VPIN + Manipulation phase synergy ────────────────────────────────
+    if vpin.get("toxicity") == "EXTREME" and cycle.get("phase") in ("DORMANT", "BUILDUP"):
+        cycle["description"] += (
+            f" ⚠ VPIN CONFIRMATION: Extreme toxic flow ({vpin['vpin_zscore']:+.1f}σ) "
+            f"in {cycle['phase']} phase = HIGH-PRIORITY STOP-HUNT SIGNAL."
+        )
+        cycle["confidence"] = min(cycle.get("confidence", 0.5) + 0.15, 0.95)
 
     # --- Funding level context for BTC interaction signals ---
     # Get current funding percentile from historical data
@@ -2472,6 +2915,14 @@ def compute_projections(data, market_state):
     if cg_oi_fund.get("available"):
         parts.append(f"*OI/Funding:* {cg_oi_fund['description']}")
 
+    # New structural intelligence
+    if hmm_regime.get("available"):
+        parts.append(f"*HMM Regime:* {hmm_regime['description']}")
+    if ghost_long.get("state") != "NORMAL":
+        parts.append(f"*Ghost Long:* {ghost_long['description']}")
+    if vpin.get("available") and vpin.get("toxicity") in ("ELEVATED", "EXTREME"):
+        parts.append(f"*VPIN Proxy:* {vpin['description']}")
+
     # Settlement cycle: always include (key trade window context)
     parts.append(f"*Settlement Cycle:* {settlement['description']}")
     if liq_cascade.get("cascade_detected"):
@@ -2511,6 +2962,9 @@ def compute_projections(data, market_state):
         "coinglass_oi_funding": cg_oi_fund,
         "funding_settlement": settlement,
         "liq_cascade": liq_cascade,
+        "ghost_long": ghost_long,
+        "hmm_regime": hmm_regime,
+        "vpin_proxy": vpin,
         "trade_setups": trade_setups,
         "summary": summary,
     }

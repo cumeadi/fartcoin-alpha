@@ -311,6 +311,48 @@ with tab_signal:
             x=ohlcv.index, y=ohlcv[price_col], name="Price",
             line=dict(color="#64b5f6", width=1.5)), row=1, col=1)
 
+        # ── S/R level overlays ────────────────────────────────────────────────
+        _sr = proj.get("support_resistance", {})
+        if _sr.get("available", False):
+            _cur_p  = _sr.get("current_price", 0)
+            _levels = _sr.get("levels", [])
+            for _lv in _levels:
+                _lv_price     = _lv.get("price", 0)
+                _lv_type      = _lv.get("type", "support")    # "support" or "resistance"
+                _lv_strength  = _lv.get("strength", 0.5)
+                _lv_methods   = _lv.get("methods", [])
+                _opacity      = 0.35 + 0.5 * _lv_strength     # 0.35–0.85 based on strength
+                _color        = "#ef9a9a" if _lv_type == "resistance" else "#a5d6a7"
+                _dist_pct     = abs(_lv_price - _cur_p) / (_cur_p + 1e-9) * 100
+                _meth_str     = "+".join(_lv_methods) if _lv_methods else ""
+                _ann          = (f"{'R' if _lv_type == 'resistance' else 'S'}"
+                                 f" ${_lv_price:.5f} ({_dist_pct:.1f}%)"
+                                 + (f" [{_meth_str}]" if _meth_str else ""))
+                fig.add_hline(
+                    y=_lv_price,
+                    line_color=_color,
+                    line_dash="dot",
+                    line_width=max(0.8, 1.5 * _lv_strength),
+                    opacity=_opacity,
+                    annotation_text=_ann,
+                    annotation_font_size=9,
+                    annotation_font_color=_color,
+                    row=1, col=1,
+                )
+            # Value area shading (70% of volume)
+            _va_lo = _sr.get("value_area_low")
+            _va_hi = _sr.get("value_area_high")
+            if _va_lo and _va_hi:
+                fig.add_hrect(
+                    y0=_va_lo, y1=_va_hi,
+                    fillcolor="rgba(100,181,246,0.05)",
+                    line_width=0,
+                    annotation_text="Value Area (70% vol)",
+                    annotation_font_size=8,
+                    annotation_font_color="rgba(100,181,246,0.5)",
+                    row=1, col=1,
+                )
+
         comp = signals["composite"]
         fig.add_trace(go.Scatter(
             x=comp.index, y=comp, name="Composite",
@@ -336,6 +378,62 @@ with tab_signal:
             template="plotly_dark", margin=dict(t=30, b=10),
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        # ── S/R Summary Panel ─────────────────────────────────────────────────
+        _sr = proj.get("support_resistance", {})
+        if _sr.get("available", False):
+            with st.expander("🧱 Support & Resistance Levels", expanded=False):
+                _cur_p   = _sr.get("current_price", 0)
+                _levels  = _sr.get("levels", [])
+                _va_lo   = _sr.get("value_area_low")
+                _va_hi   = _sr.get("value_area_high")
+                _ns_dict = _sr.get("nearest_support")
+                _nr_dict = _sr.get("nearest_resistance")
+                _rr      = _sr.get("risk_reward", 1.0)
+
+                _c1, _c2, _c3 = st.columns(3)
+                if _ns_dict:
+                    _dist = abs(_ns_dict.get("distance_pct", 0))
+                    _c1.metric(
+                        "🟢 Nearest Support",
+                        f"${_ns_dict['price']:.5f}",
+                        f"-{_dist:.2f}% | str={_ns_dict['strength']:.2f}",
+                    )
+                if _nr_dict:
+                    _dist = abs(_nr_dict.get("distance_pct", 0))
+                    _c2.metric(
+                        "🔴 Nearest Resistance",
+                        f"${_nr_dict['price']:.5f}",
+                        f"+{_dist:.2f}% | str={_nr_dict['strength']:.2f}",
+                    )
+                _c3.metric("⚖️ Risk/Reward", f"{_rr:.2f}x", "nearest R / nearest S")
+
+                if _va_lo and _va_hi:
+                    _in_va = _va_lo <= _cur_p <= _va_hi
+                    st.markdown(
+                        f"**Value Area (70% vol):** ${_va_lo:.5f} – ${_va_hi:.5f}"
+                        + (f"  ← *price inside value area*" if _in_va else "  ← *price outside value area*")
+                    )
+
+                # Level table
+                if _levels:
+                    _lv_rows = []
+                    for _lv in sorted(_levels, key=lambda l: l["price"], reverse=True):
+                        _dp = (_lv["price"] - _cur_p) / (_cur_p + 1e-9) * 100
+                        _lv_rows.append({
+                            "Type":       "🔴 R" if _lv["type"] == "resistance" else "🟢 S",
+                            "Price":      f"${_lv['price']:.5f}",
+                            "Dist %":     f"{_dp:+.2f}%",
+                            "Strength":   f"{'⬆' if _lv['strength'] > 0.7 else '▶' if _lv['strength'] > 0.4 else '▼'} {_lv['strength']:.2f}",
+                            "Touches":    _lv.get("touches", "—"),
+                            "Bounce%":    f"{_lv.get('bounce_rate', 0)*100:.0f}%",
+                            "Methods":    "+".join(_lv.get("methods", [])),
+                        })
+                    st.dataframe(
+                        pd.DataFrame(_lv_rows),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
         # ── Historical trades ─────────────────────────────────────────────────
         trades = data.get("trades")

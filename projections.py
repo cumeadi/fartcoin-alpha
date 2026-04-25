@@ -35,6 +35,13 @@ try:
     _SCORER_AVAILABLE = True
 except ImportError:
     _SCORER_AVAILABLE = False
+
+try:
+    from support_resistance import compute_sr_levels as _compute_sr_levels
+    _SR_AVAILABLE = True
+except ImportError:
+    _SR_AVAILABLE = False
+
 from datetime import datetime, timezone
 
 from market_state import (
@@ -2576,6 +2583,7 @@ def compute_projections(data, market_state):
     ghost_long = _detect_ghost_long(data)
     hmm_regime = _classify_hmm_regime(data, market_state)
     vpin       = _compute_vpin_proxy(data)
+    sr_levels  = _compute_sr_levels(data) if _SR_AVAILABLE else {"available": False}
 
     # ── HMM regime adjusts conviction on probability model ───────────────
     # In HAKAI regime, suppress entries regardless of composite score.
@@ -2833,6 +2841,7 @@ def compute_projections(data, market_state):
         "ghost_long": ghost_long,
         "hmm_regime": hmm_regime,
         "vpin_proxy": vpin,
+        "support_resistance": sr_levels,
         "opportunity": opportunity,
         "trade_setups": trade_setups,
         "summary": summary,

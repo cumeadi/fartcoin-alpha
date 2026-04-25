@@ -196,6 +196,27 @@ def build_meta_features(data):
     except Exception:
         df["liq_cluster_recent"] = 0.0
 
+    # ── Rolling S/R distance proxy (stochastic-style, vectorized) ──────────────
+    # Captures price position within recent range as a fast rolling S/R proxy.
+    # Full S/R engine (support_resistance.py) is used for visualization; this
+    # provides historical per-row features for the walk-forward meta-model.
+    try:
+        _prc   = pd.Series(prices[:n])
+        _lo168 = _prc.rolling(168, min_periods=24).min()
+        _hi168 = _prc.rolling(168, min_periods=24).max()
+        # Distance below recent high = space to resistance
+        df["dist_to_resistance_pct"] = ((_hi168 - _prc) / (_prc + 1e-9)).clip(0, 0.5).fillna(0.05).values
+        # Distance above recent low  = space to support
+        df["dist_to_support_pct"]    = ((_prc - _lo168) / (_prc + 1e-9)).clip(0, 0.5).fillna(0.05).values
+        # Risk/reward: how much room to resistance vs distance above support
+        df["sr_risk_reward"] = np.clip(
+            df["dist_to_resistance_pct"] / (df["dist_to_support_pct"] + 1e-9), 0.05, 20.0
+        )
+    except Exception:
+        df["dist_to_resistance_pct"] = 0.05
+        df["dist_to_support_pct"]    = 0.05
+        df["sr_risk_reward"]         = 1.0
+
     # ── BTC lead-lag + rolling correlation regime ────────────────────────────
     if btc_df is not None and len(btc_df) > 0:
         btc_col_   = "price" if "price" in btc_df.columns else btc_df.columns[0]
@@ -273,6 +294,7 @@ META_FEATURES = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_enc", "session_bad",
     "hmm_hakai", "hmm_accum", "hmm_steady",
     "vol_ratio",
+    "dist_to_support_pct", "dist_to_resistance_pct", "sr_risk_reward",
     # liq_cluster_recent removed: permutation test showed zero IC contribution
     # (only 4 weeks of data — insufficient history for the model to learn from)
 ]

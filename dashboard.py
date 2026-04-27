@@ -171,7 +171,7 @@ def _severity_color(sev):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HEADER — single line of key metrics
+# PRE-COMPUTE — shortcuts used across header + all tabs
 # ─────────────────────────────────────────────────────────────────────────────
 
 direction  = action["direction"]
@@ -185,74 +185,158 @@ risk_label = "HIGH" if risk_score >= 4 else "MOD" if risk_score >= 2 else "LOW"
 avg_funding= mkt.get("avg_funding", 0)
 total_oi   = mkt.get("total_oi", 0)
 
-# Direction banner
-_dir_colors = {
-    "LONG":  {"HIGH": "#1b5e20", "MEDIUM": "#2e7d32", "LOW": "#388e3c"},
-    "SHORT": {"HIGH": "#b71c1c", "MEDIUM": "#c62828", "LOW": "#d32f2f"},
-    "FLAT":  {"HIGH": "#37474f", "MEDIUM": "#37474f", "LOW": "#37474f"},
-}
-_banner_color = _dir_colors.get(direction, _dir_colors["FLAT"]).get(conviction, "#37474f")
-_dir_icon = {"LONG": "⬆️", "SHORT": "⬇️", "FLAT": "⏸️"}.get(direction, "⏸️")
+# Projection shortcuts (available globally so Tab 1 can use them too)
+opp        = proj.get("opportunity", {})
+_hmm       = proj.get("hmm_regime", {})
+_sr        = proj.get("support_resistance", {})
 
-freshness_html = ""
-if _data_age_min is not None:
-    if _data_age_min < 35:
-        freshness_html = f'<span style="font-size:0.75rem;opacity:0.7">Data {_data_age_min:.0f}m ago</span>'
+_score     = opp.get("score", 0)
+_tier      = opp.get("tier", "WATCH")
+_size_pct  = opp.get("size_pct", 0)
+_kelly_f   = opp.get("kelly_fraction", 0)
+_meta_prob = opp.get("meta_prob", 0.5)
+_top_drv   = opp.get("top_drivers", [])
+
+_hmm_regime = _hmm.get("regime_label", "STEADY_STATE")
+_hmm_conf   = _hmm.get("confidence", 0)
+_hmm_hours  = _hmm.get("hours_in_regime", 0)
+
+_ns  = _sr.get("nearest_support")   or {}
+_nr  = _sr.get("nearest_resistance") or {}
+_rr  = _sr.get("risk_reward", 1.0)
+
+# ── Unified action state (single truth for the desk) ─────────────────────────
+# Combines meta-model tier + direction into one clear instruction.
+if _tier in ("BLOCKED", "BLOCKED (SESSION)"):
+    if _hmm_regime == "HAKAI":
+        _brief_label  = "STAND ASIDE"
+        _brief_reason = (f"HAKAI regime active ({_hmm_conf:.0%} conf, {_hmm_hours}h). "
+                         f"Distribution phase — smart money exiting. No new longs or shorts.")
     else:
-        freshness_html = f'<span style="font-size:0.75rem;color:#ff8f00">⚠ Data {_data_age_min:.0f}m old</span>'
+        _brief_label  = "STAND ASIDE"
+        _brief_reason = (f"Session gate ({session}). This window has no historical edge. "
+                         f"Wait for Asia / London / NYC open.")
+    _brief_icon  = "⛔"
+    _brief_color = "#7f0000"
+    _brief_bg    = "#2d0000"
+elif _tier == "PASS":
+    _brief_label  = "NO TRADE"
+    _brief_reason = f"Signal below threshold (score {_score}/100). No edge above Bybit carry cost. Stay flat."
+    _brief_icon  = "⏸"
+    _brief_color = "#546e7a"
+    _brief_bg    = "#1a2226"
+elif _tier == "WATCH":
+    _brief_label  = "WATCH — NOT YET"
+    _brief_reason = f"Setup forming but not confirmed (score {_score}/100). Monitor — do not enter yet."
+    _brief_icon  = "👁"
+    _brief_color = "#e65100"
+    _brief_bg    = "#1a1000"
+elif direction == "LONG" and _tier in ("TRADE", "HIGH CONVICTION", "FULL SEND"):
+    _brief_label  = "LONG"
+    _brief_reason = f"{conviction} conviction. Score {_score}/100 — {_tier}. Kelly size: {_size_pct}%."
+    _brief_icon  = "⬆"
+    _brief_color = "#1b5e20"
+    _brief_bg    = "#001200"
+elif direction == "SHORT" and _tier in ("TRADE", "HIGH CONVICTION", "FULL SEND"):
+    _brief_label  = "SHORT"
+    _brief_reason = f"{conviction} conviction. Score {_score}/100 — {_tier}. Kelly size: {_size_pct}%."
+    _brief_icon  = "⬇"
+    _brief_color = "#b71c1c"
+    _brief_bg    = "#1a0000"
+else:
+    _brief_label  = "NO TRADE"
+    _brief_reason = f"Composite {composite:+.3f} — no directional edge. Wait for confirmation."
+    _brief_icon  = "⏸"
+    _brief_color = "#546e7a"
+    _brief_bg    = "#1a2226"
 
-_weekend_badge = "<span style='background:#ff8f00;padding:2px 8px;border-radius:4px;font-size:0.8rem;margin-left:10px'>WEEKEND MODE</span>" if mkt.get("is_weekend") else ""
-st.markdown(
-    f'<div style="background:{_banner_color};color:white;padding:14px 20px;border-radius:10px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">'
-    f'<div><span style="font-size:1.5rem;font-weight:800">{_dir_icon} {direction} — {conviction} CONVICTION</span>'
-    f'{_weekend_badge}'
-    f'<span style="margin-left:20px;font-size:0.95rem;opacity:0.9">{action["timing"]}</span></div>'
-    f'<div style="text-align:right;font-size:0.8rem;opacity:0.85">{freshness_html}<br>{utc_now.strftime("%H:%M UTC")}</div>'
-    f'</div>',
-    unsafe_allow_html=True,
+# ── Trade setup levels (entry / stop / target) ────────────────────────────────
+_entry  = fart_price
+_stop   = _ns.get("price", 0) if _brief_label == "LONG"  else _nr.get("price", 0)
+_target = _nr.get("price", 0) if _brief_label == "LONG"  else _ns.get("price", 0)
+_stop_pct   = (_stop   - _entry) / (_entry + 1e-9) * 100 if _stop   else 0
+_target_pct = (_target - _entry) / (_entry + 1e-9) * 100 if _target else 0
+_setup_rr   = abs(_target_pct / (_stop_pct + 1e-9)) if _stop_pct else 0
+
+# ── Freshness badge ───────────────────────────────────────────────────────────
+_fresh_str = ""
+if _data_age_min is not None:
+    _fresh_str = (f"Data {_data_age_min:.0f}m ago" if _data_age_min < 35
+                  else f"⚠ Data {_data_age_min:.0f}m old — refresh needed")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADE DESK BRIEF — the single card the desk reads first
+# ─────────────────────────────────────────────────────────────────────────────
+
+_weekend_note  = " 🏖 WEEKEND" if mkt.get("is_weekend") else ""
+_hmm_pill_col  = "#ef9a9a" if _hmm_regime == "HAKAI" else "#a5d6a7" if _hmm_regime == "ACCUMULATION" else "#90caf9"
+_fund_pill_col = "#ef9a9a" if avg_funding > 0.3 else "#a5d6a7" if avg_funding < 0 else "#ffffff"
+_risk_pill_col = "#ef9a9a" if risk_score >= 4 else "#f9a825" if risk_score >= 2 else "#a5d6a7"
+_time_pill     = utc_now.strftime("%H:%M UTC") + (f" · {_fresh_str}" if _fresh_str else "")
+_stale_html    = (
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#ff8f00">⚠ {_fresh_str}</span>'
+    if _data_age_min and _data_age_min >= 35 else
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">{_time_pill}</span>'
 )
+_levels_html = ""
+if _brief_label in ("LONG", "SHORT") and _stop and _target:
+    _levels_html = (
+        f'<div style="margin-top:12px;display:flex;gap:24px;font-size:0.88rem">'
+        f'<span style="color:#aaa">Entry <b style="color:#fff">${_entry:.5f}</b></span>'
+        f'<span style="color:#aaa">Stop <b style="color:#ef9a9a">${_stop:.5f} ({_stop_pct:+.1f}%)</b></span>'
+        f'<span style="color:#aaa">Target <b style="color:#a5d6a7">${_target:.5f} ({_target_pct:+.1f}%)</b></span>'
+        f'<span style="color:#aaa">R/R <b style="color:#fff">{_setup_rr:.1f}x</b></span>'
+        f'</div>'
+    )
 
-# Metric strip
-mc = st.columns(8)
-mc[0].metric("FART", f"${fart_price:.4f}")
-mc[1].metric("Composite", f"{composite:+.3f}")
-mc[2].metric("Funding", f"{avg_funding:.4f}")
-mc[3].metric("BTC", f"${btc_price:,.0f}")
-mc[4].metric("BTC Regime", mkt.get("btc_regime", "?"))
-mc[5].metric("OI", f"${total_oi/1e6:.0f}M")
-mc[6].metric("Session", f"{session} ({mkt.get('session_info',{}).get('et','')})")
-mc[7].metric("Manip Risk", f"{risk_label} {risk_score}/7")
+_brief_html = (
+    f'<div style="background:{_brief_bg};border:2px solid {_brief_color};border-radius:12px;padding:18px 24px;margin-bottom:14px">'
+    f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+    f'<div>'
+    f'<div style="font-size:2rem;font-weight:900;color:{_brief_color};letter-spacing:0.5px">{_brief_icon} {_brief_label}{_weekend_note}</div>'
+    f'<div style="color:#ccc;font-size:0.95rem;margin-top:4px">{_brief_reason}</div>'
+    f'{_levels_html}'
+    f'</div>'
+    f'<div style="text-align:right;min-width:140px">'
+    f'<div style="font-size:2.5rem;font-weight:900;color:{_brief_color}">{_size_pct}<span style="font-size:1rem;color:#888">% size</span></div>'
+    f'<div style="color:#aaa;font-size:0.8rem">Score {_score}/100 · {_tier}</div>'
+    f'<div style="color:#aaa;font-size:0.8rem">Kelly {_kelly_f:.0%} · p={_meta_prob:.0%}</div>'
+    f'</div>'
+    f'</div>'
+    f'<div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px;font-size:0.78rem">'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">HMM: <b style="color:{_hmm_pill_col}">{_hmm_regime} {_hmm_conf:.0%}</b></span>'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">Session: <b style="color:#fff">{session}</b></span>'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">FART: <b style="color:#64b5f6">${fart_price:.5f}</b></span>'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">BTC: <b style="color:#fff">${btc_price:,.0f}</b></span>'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">Funding: <b style="color:{_fund_pill_col}">{avg_funding:.4f}</b></span>'
+    f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">Risk: <b style="color:{_risk_pill_col}">{risk_label} {risk_score}/7</b></span>'
+    f'{_stale_html}'
+    f'</div>'
+    f'</div>'
+)
+st.markdown(_brief_html, unsafe_allow_html=True)
 
-# Inline notes (funding, BTC, session warnings) — compact
+# ── Alerts bar ────────────────────────────────────────────────────────────────
+if all_alerts:
+    for al in all_alerts:
+        sev   = al.get("severity", "low")
+        color = _severity_color(sev)
+        label = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(sev, sev.upper())
+        st.markdown(
+            f'<div class="alert-card" style="background:{color}22;border-left:4px solid {color};margin-top:6px">'
+            f'<b style="color:{color}">[{label}]</b> {al["title"]}</div>',
+            unsafe_allow_html=True,
+        )
+
+# ── Inline notes ──────────────────────────────────────────────────────────────
 _notes = []
 if action.get("funding_note"):  _notes.append(("💰", action["funding_note"], "warning"))
 if action.get("btc_note"):      _notes.append(("₿",  action["btc_note"],     "info"))
 if action.get("session_note"):  _notes.append(("⏰", action["session_note"],  "error"))
 if action.get("asia_note"):     _notes.append(("🌏", action["asia_note"],    "info"))
 if action.get("weekend_note"):  _notes.append(("🏖️", action["weekend_note"], "warning"))
-for icon, note, kind in _notes:
-    getattr(st, kind)(f"{icon} {note}")
-
-st.markdown("---")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ACTIVE ALERTS BAR  (always visible before tabs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-if all_alerts:
-    st.markdown(f"#### 🚨 Active Alerts ({len(all_alerts)})")
-    for al in all_alerts:
-        sev   = al.get("severity", "low")
-        color = _severity_color(sev)
-        label = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(sev, sev.upper())
-        st.markdown(
-            f'<div class="alert-card" style="background:{color}22;border-left:4px solid {color}">'
-            f'<b style="color:{color}">[{label}]</b> {al["title"]}</div>',
-            unsafe_allow_html=True,
-        )
-else:
-    st.success("✅ No active alerts")
+for _ic, _nt, _kd in _notes:
+    getattr(st, _kd)(f"{_ic} {_nt}")
 
 st.markdown("---")
 
@@ -284,22 +368,66 @@ with tab_signal:
     else:
         price_col = "price" if "price" in ohlcv.columns else "close"
 
-        # ── Signal component gauges (top of tab) ─────────────────────────────
-        st.markdown("#### Signal Components — Current Reading")
+        # ── Why this call? (key reasons) ─────────────────────────────────────
         sig_cols = [c for c in signals.columns if c.startswith("sig_")]
         sig_vals = {c: float(signals[c].dropna().iloc[-1]) for c in sig_cols
                     if len(signals[c].dropna()) > 0}
 
-        if sig_vals:
-            cols = st.columns(len(sig_vals))
-            for i, (col_name, val) in enumerate(sig_vals.items()):
-                label = col_name.replace("sig_", "").replace("_", " ").title()
-                icon  = "🟢" if val > 0.2 else "🔴" if val < -0.2 else "⚪"
-                cols[i].metric(f"{icon} {label}", f"{val:+.3f}")
+        _reasons = []
+        # HMM regime
+        if _hmm_regime == "HAKAI":
+            _reasons.append(("🚫", f"HMM HAKAI ({_hmm_conf:.0%}, {_hmm_hours}h) — distribution phase, smart money exiting"))
+        elif _hmm_regime == "ACCUMULATION":
+            _reasons.append(("⬆️", f"HMM ACCUMULATION ({_hmm_conf:.0%}, {_hmm_hours}h) — institutional buying, amplified conviction"))
+        else:
+            _reasons.append(("⚪", f"HMM STEADY STATE ({_hmm_conf:.0%}) — neutral regime, raise bar to 60%+"))
+        # Composite
+        _comp_str = "bullish" if composite > 0.3 else "bearish" if composite < -0.3 else "neutral/weak"
+        _reasons.append(("📊", f"Composite {composite:+.3f} — {_comp_str}"))
+        # Top model drivers
+        for feat, imp in (_top_drv[:2] if _top_drv else []):
+            _fd = feat.replace("sig_", "").replace("_", " ").upper()
+            _reasons.append(("🔑", f"Top driver: {_fd} (importance {imp:.0f})"))
+        # Funding
+        if avg_funding > 0.3:
+            _reasons.append(("💰", f"Funding {avg_funding:.4f} — longs crowded, fade risk elevated"))
+        elif avg_funding < 0:
+            _reasons.append(("💰", f"Funding {avg_funding:.4f} — shorts crowded, potential squeeze"))
+        # S/R context
+        if _sr.get("available"):
+            _ns_dist = abs(_ns.get("distance_pct", 0))
+            _nr_dist = abs(_nr.get("distance_pct", 0))
+            if _ns_dist < 1.0:
+                _reasons.append(("🟢", f"Price at strong support ${_ns.get('price',0):.5f} ({_ns_dist:.1f}% below) — str {_ns.get('strength',0):.2f}"))
+            if _nr_dist < 1.0:
+                _reasons.append(("🔴", f"Price at resistance ${_nr.get('price',0):.5f} ({_nr_dist:.1f}% above) — str {_nr.get('strength',0):.2f}"))
+        # Session
+        if session in ("Late NYC",):
+            _reasons.append(("⏰", "Late NYC (20-24h UTC) — historically no edge, session-gated"))
+        # Alerts
+        for _al in all_alerts[:2]:
+            _reasons.append(("🚨", _al.get("title", "")[:80]))
 
-        st.markdown("---")
+        # Render reasons as a clean list
+        if _reasons:
+            _why_html = '<div style="background:#1a2226;border-radius:8px;padding:14px 18px;margin-bottom:14px">'
+            _why_html += '<div style="font-size:0.72rem;color:#607d8b;font-weight:700;letter-spacing:1px;margin-bottom:10px">WHY THIS CALL</div>'
+            for _icon, _txt in _reasons:
+                _why_html += f'<div style="margin-bottom:6px;font-size:0.88rem;color:#ccc">{_icon} {_txt}</div>'
+            _why_html += '</div>'
+            st.markdown(_why_html, unsafe_allow_html=True)
 
         # ── Price + Composite chart ───────────────────────────────────────────
+        # ── Signal components (collapsed — drill-down only) ──────────────────
+        with st.expander("📡 Signal Components (drill-down)", expanded=False):
+            if sig_vals:
+                _sc = st.columns(len(sig_vals))
+                for _i, (_cn, _v) in enumerate(sig_vals.items()):
+                    _lbl = _cn.replace("sig_", "").replace("_", " ").title()
+                    _ico = "🟢" if _v > 0.2 else "🔴" if _v < -0.2 else "⚪"
+                    _sc[_i].metric(f"{_ico} {_lbl}", f"{_v:+.3f}")
+
+        # ── Price + S/R chart ─────────────────────────────────────────────────
         st.markdown("#### Price vs Composite Signal")
         fig = make_subplots(
             rows=3, cols=1, shared_xaxes=True,
@@ -312,7 +440,6 @@ with tab_signal:
             line=dict(color="#64b5f6", width=1.5)), row=1, col=1)
 
         # ── S/R level overlays ────────────────────────────────────────────────
-        _sr = proj.get("support_resistance", {})
         if _sr.get("available", False):
             _cur_p  = _sr.get("current_price", 0)
             _levels = _sr.get("levels", [])
@@ -419,15 +546,14 @@ with tab_signal:
         st.plotly_chart(fig, use_container_width=True)
 
         # ── S/R Summary Panel ─────────────────────────────────────────────────
-        _sr = proj.get("support_resistance", {})
         if _sr.get("available", False):
             with st.expander("🧱 Support & Resistance Levels", expanded=False):
                 _cur_p   = _sr.get("current_price", 0)
                 _levels  = _sr.get("levels", [])
                 _va_lo   = _sr.get("value_area_low")
                 _va_hi   = _sr.get("value_area_high")
-                _ns_dict = _sr.get("nearest_support")
-                _nr_dict = _sr.get("nearest_resistance")
+                _ns_dict = _ns
+                _nr_dict = _nr
                 _rr      = _sr.get("risk_reward", 1.0)
 
                 _c1, _c2, _c3 = st.columns(3)
@@ -496,14 +622,13 @@ with tab_proj:
     )
 
     # ── Opportunity Score Meter ───────────────────────────────────────────────
-    opp = proj.get("opportunity", {})
     if opp.get("available"):
-        score     = opp.get("score", 50)
-        tier      = opp.get("tier", "WATCH")
-        size_pct  = opp.get("size_pct", 0)
+        score     = _score
+        tier      = _tier
+        size_pct  = _size_pct
         hmm_label = opp.get("hmm_label", "—")
-        meta_prob = opp.get("meta_prob", 0.5)
-        top_drv   = opp.get("top_drivers", [])
+        meta_prob = _meta_prob
+        top_drv   = _top_drv
 
         tier_colors = {
             "BLOCKED":          ("#b71c1c", "🚫"),

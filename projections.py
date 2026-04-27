@@ -2630,7 +2630,11 @@ def compute_projections(data, market_state):
     if _SCORER_AVAILABLE:
         try:
             meta_df = build_meta_features(data)
-            opportunity = _score_live_meta(meta_df)
+            # Pass the live HMM label so score_live() can enforce the HAKAI gate
+            # even when the walk-forward rolling HMM disagrees (they use different
+            # history windows — live full-history label is authoritative).
+            _live_hmm_lbl = hmm_regime.get("regime_label") if hmm_regime.get("available") else None
+            opportunity = _score_live_meta(meta_df, live_hmm_label=_live_hmm_lbl)
         except Exception as _e:
             opportunity["error"] = str(_e)
 

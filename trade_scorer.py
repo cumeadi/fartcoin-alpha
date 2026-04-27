@@ -50,7 +50,7 @@ try:
 except ImportError:
     _LGBM_OK = False
 
-from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_matrix as _hmm_features
+from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_matrix as _hmm_features, label_current as _hmm_label_current
 from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
 
@@ -390,7 +390,7 @@ def walk_forward_meta(df):
 # Live scorer (uses last trained model implicitly via full-history features)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_live(df, projections=None):
+def score_live(df, projections=None, live_hmm_label=None):
     """
     Train meta-model on all available history, then score the current row.
 
@@ -418,6 +418,21 @@ def score_live(df, projections=None):
     except Exception:
         current_hour = 12
     is_bad_session = (current_hour >= 20)
+
+    # ── Live HAKAI override ───────────────────────────────────────────────────
+    # The walk-forward rolling HMM in build_meta_features() uses a 500h window
+    # and can disagree with the full-history live HMM from hmm_engine.label_current().
+    # The live label is authoritative — if it says HAKAI, block regardless of feature.
+    # Priority: explicit live_hmm_label arg > data-based live label > feature value.
+    live_is_hakai = False
+    if live_hmm_label is not None:
+        live_is_hakai = (live_hmm_label == "HAKAI")
+    else:
+        try:
+            _live_lbl = _hmm_label_current(df._data if hasattr(df, '_data') else {})
+            live_is_hakai = (_live_lbl.get("regime_label") == "HAKAI")
+        except Exception:
+            pass  # fall back to feature value only
 
     X_train = train[available_features].values
     y_train = train["target_4h"].values
@@ -467,7 +482,10 @@ def score_live(df, projections=None):
 
         # ── Tier classification ───────────────────────────────────────────────
         hmm = int(row.get("hmm_regime", 0))
-        if int(row.get("hmm_hakai", 0)) == 1:
+        # Use live_is_hakai (full-history HMM) as authoritative gate, with
+        # feature-based hmm_hakai as fallback. This prevents the walk-forward
+        # rolling HMM from contradicting the live full-history classifier.
+        if int(row.get("hmm_hakai", 0)) == 1 or live_is_hakai:
             tier  = "BLOCKED"        # HAKAI — distribution phase
             score = min(score, 25)
         elif is_bad_session:

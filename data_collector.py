@@ -391,6 +391,11 @@ def collect_all(cmc_symbol="FARTCOIN", perp_symbol="FARTCOINUSDT",
     btc_chart = _safe_fetch("CG BTC Chart", fetch_cg_historical_chart, "bitcoin", days)
     results["btc_chart"] = btc_chart
 
+    # --- Step 2c: CoinGecko SOL chart (FARTCOIN is Solana-based — SOL leads FART) ---
+    print("[2c/4] Fetching CoinGecko SOL chart (hourly)...")
+    sol_chart = _safe_fetch("CG SOL Chart", fetch_cg_historical_chart, "solana", days)
+    results["sol_chart"] = sol_chart
+
     # --- Step 3: CoinGecko derivatives snapshot (ALL exchanges) ---
     print("[3/4] Fetching CoinGecko derivatives snapshot...")
     deriv = _safe_fetch("CG Derivatives", fetch_cg_derivatives_tickers, cmc_symbol)

@@ -73,6 +73,12 @@ def load_data(perp_symbol="FARTCOINUSDT", cmc_symbol="FARTCOIN",
         data["btc"] = pd.read_csv(btc_file, index_col=0, parse_dates=True)
         print(f"  Loaded BTC chart: {len(data['btc'])} rows")
 
+    # SOL hourly chart (FARTCOIN is Solana-based — SOL momentum leads FART)
+    sol_file = DATA_DIR / "solana_cg_chart.csv"
+    if sol_file.exists():
+        data["sol"] = pd.read_csv(sol_file, index_col=0, parse_dates=True)
+        print(f"  Loaded SOL chart: {len(data['sol'])} rows")
+
     # --- External data sources ---
 
     # News sentiment (CryptoPanic hourly aggregates)

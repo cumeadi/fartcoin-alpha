@@ -218,6 +218,7 @@ def build_meta_features(data):
         df["sr_risk_reward"]         = 1.0
 
     # ── BTC lead-lag + rolling correlation regime ────────────────────────────
+    fart_ret_s = pd.Series(np.diff(prices, prepend=prices[0]) / (prices + 1e-9))
     if btc_df is not None and len(btc_df) > 0:
         btc_col_   = "price" if "price" in btc_df.columns else btc_df.columns[0]
         btc_prices = btc_df[btc_col_].values[:n].astype(float)
@@ -225,7 +226,6 @@ def build_meta_features(data):
         df["btc_2h_ret"] = btc_2h[:n]
         # Rolling 168h BTC-FART return correlation
         # High (>0.7) = BTC lead-lag signals are reliable; Low (<0.4) = FART solo regime
-        fart_ret_s = pd.Series(np.diff(prices, prepend=prices[0]) / (prices + 1e-9))
         btc_ret_s  = pd.Series(btc_2h[:n])
         df["btc_corr_7d"] = (
             fart_ret_s.rolling(168, min_periods=48).corr(btc_ret_s)
@@ -234,6 +234,36 @@ def build_meta_features(data):
     else:
         df["btc_2h_ret"]  = 0.0
         df["btc_corr_7d"] = 0.65
+
+    # ── SOL lead-lag (FARTCOIN is Solana-based — SOL momentum leads FART) ───────
+    # SOL 2h return: directional lead indicator (Solana ecosystem moves first)
+    # SOL-FART 48h rolling correlation: measures how "coupled" FART is to SOL
+    # right now — when correlation is high, SOL momentum is a reliable signal.
+    sol_df = data.get("sol")
+    if sol_df is not None and len(sol_df) > 0:
+        try:
+            sol_col_ = "price" if "price" in sol_df.columns else sol_df.columns[0]
+            # Time-align SOL to FARTCOIN OHLCV index (forward-fill any gaps)
+            sol_aligned = (
+                sol_df[sol_col_]
+                .reindex(ohlcv.index, method="ffill")
+                .fillna(method="bfill")
+                .fillna(sol_df[sol_col_].median())
+            ).values[:n].astype(float)
+            sol_2h    = np.diff(sol_aligned, prepend=sol_aligned[0]) / (sol_aligned + 1e-9)
+            sol_ret_s = pd.Series(sol_2h)
+            df["sol_2h_ret"] = sol_2h
+            # 48h window — SOL-FART coupling is more regime-sensitive than BTC
+            df["sol_corr_2d"] = (
+                fart_ret_s.rolling(48, min_periods=12).corr(sol_ret_s)
+                .fillna(0.5).values
+            )
+        except Exception:
+            df["sol_2h_ret"]  = 0.0
+            df["sol_corr_2d"] = 0.5
+    else:
+        df["sol_2h_ret"]  = 0.0
+        df["sol_corr_2d"] = 0.5
 
     # ── Session & time encoding (cyclic) ─────────────────────────────────────
     try:
@@ -268,6 +298,34 @@ def build_meta_features(data):
     df["hmm_accum"]    = (regimes == 1).astype(float)
     df["hmm_steady"]   = (regimes == 0).astype(float)
 
+    # ── Regime transition features ────────────────────────────────────────────
+    # hakai_exit_h: hours since the last HAKAI regime ended.
+    # Motivation: the HAKAI→ACCUMULATION flip is the best entry signal — price
+    # has just completed distribution and institutional buyers are stepping in.
+    # Currently we hard-block during HAKAI but miss the entry at the flip.
+    # Value: 0 = still in HAKAI; 1-6 = fresh exit (high opportunity); 7+ = stale.
+    # Capped at 24h so the model doesn't learn spurious long-range effects.
+    try:
+        reg_series    = pd.Series(regimes, dtype=int)
+        was_hakai     = (reg_series == 2)
+        # For each row, find how many steps ago HAKAI last ended
+        hakai_exit_h  = np.full(n, 24, dtype=float)   # default: far from any exit
+        last_hakai_end = None
+        for _i in range(n):
+            if was_hakai.iloc[_i]:
+                last_hakai_end = None          # inside HAKAI — reset
+                hakai_exit_h[_i] = 0.0        # 0 = currently in HAKAI
+            else:
+                if last_hakai_end is None:
+                    # Find the most recent row where HAKAI ended before this row
+                    _prior_hakai = was_hakai.iloc[:_i]
+                    if _prior_hakai.any():
+                        last_hakai_end = _prior_hakai.values.nonzero()[0][-1]
+                hakai_exit_h[_i] = min((_i - last_hakai_end) if last_hakai_end is not None else 24, 24)
+        df["hakai_exit_h"] = hakai_exit_h
+    except Exception:
+        df["hakai_exit_h"] = 24.0   # safe default: no recent transition
+
     # ── Forward returns (target) ──────────────────────────────────────────────
     df["fwd_ret_4h"] = pd.Series(prices, index=ohlcv.index).pct_change(4).shift(-4).values
     df["fwd_ret_8h"] = pd.Series(prices, index=ohlcv.index).pct_change(8).shift(-8).values
@@ -291,8 +349,10 @@ META_FEATURES = [
     "lsr_pct",
     "vpin_z",
     "btc_2h_ret", "btc_corr_7d",
+    # sol_2h_ret removed: permutation IC p=0.42 — no independent signal after composite
+    "sol_corr_2d",   # borderline p=0.12 but structural (SOL-FART coupling regime)
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_enc", "session_bad",
-    "hmm_hakai", "hmm_accum", "hmm_steady",
+    "hmm_hakai", "hmm_accum", "hmm_steady", "hakai_exit_h",
     "vol_ratio",
     "dist_to_support_pct", "dist_to_resistance_pct", "sr_risk_reward",
     # liq_cluster_recent removed: permutation test showed zero IC contribution

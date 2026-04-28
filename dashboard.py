@@ -375,8 +375,11 @@ with tab_signal:
 
         _reasons = []
         # HMM regime
+        _hakai_exit = _hmm.get("hakai_exit_h", 24)
         if _hmm_regime == "HAKAI":
             _reasons.append(("🚫", f"HMM HAKAI ({_hmm_conf:.0%}, {_hmm_hours}h) — distribution phase, smart money exiting"))
+        elif _hmm_regime == "ACCUMULATION" and isinstance(_hakai_exit, (int, float)) and _hakai_exit <= 6:
+            _reasons.append(("🔥", f"HMM ACCUMULATION — fresh HAKAI exit {_hakai_exit:.0f}h ago ({_hmm_conf:.0%}). Prime entry window."))
         elif _hmm_regime == "ACCUMULATION":
             _reasons.append(("⬆️", f"HMM ACCUMULATION ({_hmm_conf:.0%}, {_hmm_hours}h) — institutional buying, amplified conviction"))
         else:

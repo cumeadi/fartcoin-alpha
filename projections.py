@@ -387,8 +387,8 @@ def _project_probabilistic_return(data, state):
         "description": (
             f"{prob:.0%} prob of +4h return. Expected move: {expected_move:+.2f}%. "
             f"Conviction: {conviction}. "
-            f"Bybit threshold: {BYBIT_ENTRY_THRESHOLD:.0%} | break-even: {BYBIT_BREAK_EVEN:.0%} | "
-            f"carry cost: {BYBIT_COST_4H*100:.2f}%/4h. "
+            f"Min entry: {BYBIT_ENTRY_THRESHOLD:.0%} | Break-even after carry: {BYBIT_BREAK_EVEN:.0%} | "
+            f"Carry cost: {BYBIT_COST_4H*100:.2f}%/4h. "
             f"{entry_rec}. "
             f"(Model: {model_label}, {n_features} features, {len(df)} obs)"
             f"{session_warning}"
@@ -469,9 +469,9 @@ def _project_mean_reversion(data, state):
             "projected_cross_time_h": cross_time,
             "projected_path": [round(v, 6) for v in path],
             "description": (
-                f"Funding half-life: {ar1['half_life_h']:.1f}h. "
+                f"Funding expected to normalize in ~{ar1['half_life_h']:.1f}h. "
                 f"Current: {current_fr:.6f} (real: {real_funding:.4f}). "
-                f"{'Projected to cross neutral in ' + str(cross_time) + 'h.' if cross_time else 'Near equilibrium.'}"
+                f"{'Expected to reach neutral in ' + str(cross_time) + 'h.' if cross_time else 'Near normal levels.'}"
             ),
         }
 
@@ -528,29 +528,29 @@ def _project_mean_reversion(data, state):
         # Live calibration (Apr 2026): p84 confirmed 8h mean reversion at 93% hit rate.
         # Thresholds lowered from p90/p10 to p80/p20 to catch extremes earlier.
         if percentile > 0.85:
-            extremity = f"EXTREME LONG bias (top {(1-percentile)*100:.0f}% of history)"
+            extremity = f"Longs extremely heavy (top {(1-percentile)*100:.0f}% of history)"
             lsr_action = (
-                f"⚠ FORCED UNWIND SIGNAL — LSR at {percentile:.0%} percentile. "
-                f"Historically, longs liquidate back to median within ~{avg_revert_time:.0f}h "
-                f"({revert_rate:.0%} hit rate). This is a structural SHORT SETUP."
+                f"⚠ LONG UNWIND RISK — Longs are at {percentile:.0%} percentile. "
+                f"Historically, longs get forced out within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} of the time). Lean short."
             )
         elif percentile > 0.75:
-            extremity = f"High long bias ({percentile:.0%} percentile)"
+            extremity = f"Longs heavy ({percentile:.0%} percentile)"
             lsr_action = (
-                f"Elevated long crowding. Reversion risk within ~{avg_revert_time:.0f}h "
-                f"({revert_rate:.0%} hit rate). Avoid new longs, consider reducing."
+                f"Longs are elevated. Pullback risk within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} hit rate). Avoid adding longs."
             )
         elif percentile < 0.15:
-            extremity = f"EXTREME SHORT bias (bottom {percentile*100:.0f}% of history)"
+            extremity = f"Shorts extremely heavy (bottom {percentile*100:.0f}% of history)"
             lsr_action = (
-                f"⚠ FORCED SHORT COVER — LSR at {percentile:.0%} percentile. "
-                f"Short squeeze risk within ~{avg_revert_time:.0f}h ({revert_rate:.0%} hit rate)."
+                f"⚠ SHORT SQUEEZE RISK — Shorts are at {percentile:.0%} percentile. "
+                f"Shorts tend to get squeezed within ~{avg_revert_time:.0f}h ({revert_rate:.0%} of the time)."
             )
         elif percentile < 0.25:
-            extremity = f"High short bias ({percentile:.0%} percentile)"
+            extremity = f"Shorts heavy ({percentile:.0%} percentile)"
             lsr_action = (
-                f"Elevated short crowding. Squeeze risk within ~{avg_revert_time:.0f}h "
-                f"({revert_rate:.0%} hit rate). Avoid new shorts."
+                f"Shorts are elevated. Squeeze risk within ~{avg_revert_time:.0f}h "
+                f"({revert_rate:.0%} hit rate). Avoid adding shorts."
             )
         else:
             extremity = f"Normal range ({percentile:.0%} percentile)"
@@ -570,7 +570,7 @@ def _project_mean_reversion(data, state):
                 f"Median: {median_lsr:.4f}. "
                 f"Avg reversion time from extremes: {avg_revert_time:.0f}h "
                 f"(revert rate: {revert_rate:.0%}). "
-                f"{'Projected to cross equilibrium in ' + str(cross_time) + 'h.' if cross_time else 'Near equilibrium.'}"
+                f"{'Expected to reach neutral in ' + str(cross_time) + 'h.' if cross_time else 'Near normal levels.'}"
                 + (f" {lsr_action}" if lsr_action else "")
             ),
         }
@@ -1570,7 +1570,7 @@ def _project_coinglass_oi_funding(data, state):
                 )
                 parts.append(
                     f"Funding negative on primary exchange(s): {_neg_exchanges} "
-                    f"(mean {mean_rate:+.3f}%) — shorts crowded, contrarian long signal"
+                    f"(mean {mean_rate:+.3f}%) — shorts are heavy, upward pressure likely"
                 )
             else:
                 # Negative rate is on a minor venue only — not actionable for Bybit traders
@@ -1584,7 +1584,7 @@ def _project_coinglass_oi_funding(data, state):
         if fund_divergence in ("HIGH_SPREAD", "ELEVATED_SPREAD"):
             parts.append(
                 f"Cross-exchange spread {spread:.3f}% "
-                f"(max: {max_rate:+.3f}% / min: {min_rate:+.3f}%) — arb/manipulation risk"
+                f"(max: {max_rate:+.3f}% / min: {min_rate:+.3f}%) — cross-exchange gap, possible manipulation"
             )
             if fund_assessment == "NORMAL":
                 fund_assessment = "FUNDING_SPREAD"
@@ -1595,7 +1595,7 @@ def _project_coinglass_oi_funding(data, state):
             parts.append(f"Predicted funding falling to {mean_predicted:+.3f}% (Δ{pred_delta:+.3f}%)")
 
         if settlement_imm:
-            parts.append(f"⚡ Settlement in {mins_to_settle:.0f}min — price pin or spike risk")
+            parts.append(f"⚡ Settlement in {mins_to_settle:.0f}min — price may pin or spike at settlement")
             if fund_assessment == "NORMAL":
                 fund_assessment = "SETTLEMENT_IMMINENT"
 
@@ -1618,7 +1618,7 @@ def _project_coinglass_oi_funding(data, state):
         if bybit_rate >= 0.005:
             parts.append(
                 f"⚠ Bybit carry: {bybit_rate:+.3f}%/8h = {bybit_daily_carry:+.2f}%/day "
-                f"({bybit_daily_carry * 7:+.1f}%/wk) — longs need >{bybit_daily_carry:.2f}%/day to profit"
+                f"({bybit_daily_carry * 7:+.1f}%/wk) — longs must gain >{bybit_daily_carry:.2f}%/day just to break even"
             )
 
         # --- Binance/Bybit divergence signal (NEW) ---
@@ -1634,7 +1634,7 @@ def _project_coinglass_oi_funding(data, state):
             divergence_signal = "BINANCE_BEARISH_VS_BYBIT"
             parts.append(
                 f"⚠ Binance/Bybit divergence: Binance {binance_rate:+.3f}% vs Bybit {bybit_rate:+.3f}% "
-                f"(Δ{binance_vs_bybit:+.3f}%) — informed market is bearish vs Bybit longs"
+                f"(Δ{binance_vs_bybit:+.3f}%) — Binance traders are positioned bearish while Bybit longs pay high carry"
             )
             result["binance_bybit_divergence"] = divergence_signal
         elif binance_rate > (BYBIT_FLOOR + 0.5):
@@ -1642,7 +1642,7 @@ def _project_coinglass_oi_funding(data, state):
             divergence_signal = "BOTH_CROWDED_LONG"
             parts.append(
                 f"Both Binance ({binance_rate:+.3f}%) and Bybit ({bybit_rate:+.3f}%) elevated "
-                f"— market-wide long crowding, reversal risk"
+                f"— longs are heavy on both exchanges, reversal risk elevated"
             )
             result["binance_bybit_divergence"] = divergence_signal
         else:
@@ -1917,7 +1917,7 @@ def _project_funding_settlement_cycle(data, state):
                 f"{result['next_settlement_utc']} ({dubai_settle_str}, in {mins_to_settle:.0f}min). "
                 f"Historically {post_mean:+.2f}% avg in 2h after settlement "
                 f"(n={n}, confidence {confidence:.0%}). "
-                f"Watch for price {'spike into settlement → fade the spike' if post_mean < 0 else 'dip into settlement → buy the dip'}."
+                f"Price often {'pumps into settlement — short once it peaks' if post_mean < 0 else 'dips into settlement — buy once it stops falling'}."
             )
         if abs(pre_mean) > 0.05 and mins_to_settle <= 90:
             pre_dir_word = "long" if pre_mean > 0 else "short"
@@ -2174,20 +2174,20 @@ def _compute_trade_setups(prob, mr, session, btc, settlement, cg_oi_fund, liq_ca
     _bounce_valid = (post_mean > 0 and settlement_conf > 0.54)
     if abs(post_mean) > 0.05 and settlement_conf > 0.4 and (_is_fade_dir or _bounce_valid):
         post_direction = "short" if post_mean < 0 else "long"
-        post_action_verb = "fade the spike" if post_mean < 0 else "buy the dip"
+        post_action_verb = "short once the move stalls" if post_mean < 0 else "buy the pullback"
 
         if settlement_phase == "JUST_SETTLED":
             active = True
             trigger = (
-                f"Settlement just occurred — {post_direction} now on any "
-                f"{'bounce' if post_mean < 0 else 'pullback'}"
+                f"Settlement just happened. {post_direction.capitalize()} on the next "
+                f"{'bounce' if post_mean < 0 else 'pullback'}."
             )
             time_note = "Active now"
         elif settlement_mins <= 180:
             active = True
             trigger = (
-                f"Watch for price {'spike' if post_mean < 0 else 'dip'} into {dubai_settle} → "
-                f"{post_action_verb} when price stalls at settlement"
+                f"Price often {'pumps' if post_mean < 0 else 'dips'} into {dubai_settle} settlement. "
+                f"{post_action_verb.capitalize()} when price stops {'rising' if post_mean < 0 else 'falling'}."
             )
             time_note = f"{settlement_mins:.0f}min to setup ({dubai_settle})"
         else:
@@ -2200,7 +2200,7 @@ def _compute_trade_setups(prob, mr, session, btc, settlement, cg_oi_fund, liq_ca
             "direction": post_direction,
             "trigger": trigger,
             "target_pct": round(abs(post_mean), 2),
-            "stop_note": "Stop above settlement spike high" if post_mean < 0 else "Stop below settlement dip low",
+            "stop_note": "Stop above the pre-settlement high" if post_mean < 0 else "Stop below the pre-settlement low",
             "confidence": round(settlement_conf, 2),
             "historical_edge": f"{post_mean:+.2f}% avg post-settlement (n={settlement.get('historical_n', 0)})",
             "time_window": time_note,
@@ -2529,7 +2529,7 @@ def _compute_vpin_proxy(data):
             toxicity = "ELEVATED"
             desc = (
                 f"ELEVATED TOXIC FLOW: VPIN proxy {vpin_now:.4f} (+{vpin_z:.1f}σ). "
-                f"Above-average OI imbalance vs price. MMs may be filling bags. "
+                f"Above-average OI imbalance vs price. Market makers may be offloading to retail. "
                 f"A Buildup signal here has higher conversion probability."
             )
         elif vpin_z < -1.0:

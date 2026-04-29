@@ -142,9 +142,9 @@ def evaluate_alerts(market_state, action):
     # --- Rule 2: Funding Extreme ---
     if abs(avg_funding) > 0.01 and _is_cooled_down(state, "funding_extreme", 4):
         if avg_funding > 0:
-            bias = "Longs crowded — contrarian bearish pressure"
+            bias = "Longs are heavy — downward pressure expected"
         else:
-            bias = "Shorts crowded — contrarian bullish pressure"
+            bias = "Shorts are heavy — upward pressure expected"
         msg = (
             f"*FARTCOIN FUNDING ALERT*\n\n"
             f"*Avg Funding Rate:* {avg_funding:.4f}\n"

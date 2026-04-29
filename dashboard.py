@@ -221,7 +221,7 @@ if _tier in ("BLOCKED", "BLOCKED (SESSION)"):
     _brief_bg    = "#2d0000"
 elif _tier == "PASS":
     _brief_label  = "NO TRADE"
-    _brief_reason = f"Signal below threshold (score {_score}/100). No edge above Bybit carry cost. Stay flat."
+    _brief_reason = f"Signal below threshold (score {_score}/100). Not enough edge to cover carry cost. Stay flat."
     _brief_icon  = "⏸"
     _brief_color = "#546e7a"
     _brief_bg    = "#1a2226"
@@ -393,9 +393,9 @@ with tab_signal:
             _reasons.append(("🔑", f"Top driver: {_fd} (importance {imp:.0f})"))
         # Funding
         if avg_funding > 0.3:
-            _reasons.append(("💰", f"Funding {avg_funding:.4f} — longs crowded, fade risk elevated"))
+            _reasons.append(("💰", f"Funding {avg_funding:.4f} — longs are heavy, downward pressure expected"))
         elif avg_funding < 0:
-            _reasons.append(("💰", f"Funding {avg_funding:.4f} — shorts crowded, potential squeeze"))
+            _reasons.append(("💰", f"Funding {avg_funding:.4f} — shorts are heavy, upward pressure expected"))
         # S/R context
         if _sr.get("available"):
             _ns_dist = abs(_ns.get("distance_pct", 0))
@@ -695,7 +695,7 @@ with tab_proj:
             '<div style="background:#263238;border-left:4px solid #546e7a;border-radius:6px;'
             'padding:12px 16px;font-size:0.9rem;color:#90a4ae">'
             '🚫 <b>NO ACTIVE SETUPS</b> — Model below 55% threshold. '
-            'No edge after Bybit carry costs. Wait for a setup to activate.</div>',
+            'Not enough edge to cover carry costs. Wait for a setup to activate.</div>',
             unsafe_allow_html=True,
         )
     else:

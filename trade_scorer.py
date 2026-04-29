@@ -358,9 +358,27 @@ def build_meta_features(data):
 # ─────────────────────────────────────────────────────────────────────────────
 
 META_FEATURES = [
-    "composite",
-    "sig_funding", "sig_oi_divergence", "sig_oi_accel",
-    "sig_lsr", "sig_taker", "sig_volume_spike",
+    # ── Round 3 cleanup (2026-04-29): removed composite + 6 redundant sig_* features ──
+    # Walk-forward backtest with full feature set (32 features incl. composite + 6 sig_*):
+    #   n=35, hit=65.7%, lift=+27.8pp, Sharpe=3.40
+    # Walk-forward backtest with cleaned feature set (25 features, this list):
+    #   n=28, hit=67.9%, lift=+30.0pp, Sharpe=3.64
+    # Improvement: +2.2pp hit rate, +0.24 Sharpe, fewer over-trades.
+    # Why removed:
+    #   composite: weighted sum of the same sig_* features below — perfect collinearity.
+    #   sig_funding: redundant with funding_z, funding_vel, funding_accel.
+    #   sig_oi_divergence: redundant with oi_4h_pct, oi_1h_pct, oi_4h_chg.
+    #   sig_oi_accel: redundant with funding_accel and oi_*_pct.
+    #   sig_lsr: redundant with lsr_pct.
+    #   sig_taker: data is synthetic constant 0.5 → feature is always 0 → noise.
+    #   sig_volume_spike: redundant with vol_ratio.
+    # Round 3 candidates rejected:
+    #   sig_pv_divergence — backtest didn't improve on clean baseline.
+    #   sig_dex_liq_div — only 13.5% non-zero coverage, no measurable backtest impact.
+    #   liq_long_short_ratio_z — failed IC (p=0.151); 168h-z-score variant improved
+    #     backtest (67.9%→73.3%) but 24h/72h/240h windows ALL degraded — overfitting.
+    #   funding_spread_z — passed IC strongly (p=0.006) but backtest didn't improve
+    #     (atr_ratio precedent: IC pass + backtest degrade = reject).
     "funding_z", "funding_vel", "funding_accel",
     # funding_sign_flip removed: permutation test showed zero IC contribution
     "oi_4h_pct", "oi_1h_pct", "oi_4h_chg",

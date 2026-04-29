@@ -196,6 +196,24 @@ def build_meta_features(data):
     except Exception:
         df["liq_cluster_recent"] = 0.0
 
+    # ── Volatility regime (ATR ratio) + price momentum ──────────────────────────
+    # atr_ratio: 14h ATR / 168h MA of ATR. >1 = elevated vol regime (IC=-0.048, p=0.024)
+    #   Rationale: high vol → carry cost harder to beat + more noise in all signals
+    #   Negative IC confirmed: model should trade LESS when vol is elevated
+    # mom12: 12h price return. IC=-0.040, p=0.061.
+    #   Negative IC = mean-reversion tendency for meme coins over 4h horizon
+    #   Rising 12h price → longs already crowded → fade setup more likely
+    try:
+        _px_s    = pd.Series(prices[:n])
+        _rets_s  = _px_s.pct_change().fillna(0)
+        _atr14   = _rets_s.abs().rolling(14, min_periods=5).mean() * _px_s
+        _atr_ma  = _atr14.rolling(168, min_periods=48).mean()
+        df["atr_ratio"] = (_atr14 / (_atr_ma + 1e-9)).clip(0.1, 5.0).fillna(1.0).values
+        df["mom12"]     = _px_s.pct_change(12).clip(-0.30, 0.30).fillna(0.0).values
+    except Exception:
+        df["atr_ratio"] = 1.0
+        df["mom12"]     = 0.0
+
     # ── Rolling S/R distance proxy (stochastic-style, vectorized) ──────────────
     # Captures price position within recent range as a fast rolling S/R proxy.
     # Full S/R engine (support_resistance.py) is used for visualization; this
@@ -355,8 +373,13 @@ META_FEATURES = [
     "hmm_hakai", "hmm_accum", "hmm_steady", "hakai_exit_h",
     "vol_ratio",
     "dist_to_support_pct", "dist_to_resistance_pct", "sr_risk_reward",
-    # liq_cluster_recent removed: permutation test showed zero IC contribution
-    # (only 4 weeks of data — insufficient history for the model to learn from)
+    # liq_cluster_recent removed: permutation IC p≈0 (only 4 weeks of data)
+    # atr_ratio: IC=-0.048, p=0.024 in isolation — but walk-forward backtest degraded
+    #   (67.9%→64.3% hit, Sharpe 3.64→2.94). Model already captures vol regime via
+    #   existing features. Kept in build_meta_features() for analysis + Kelly scaling.
+    # mom12: IC=-0.040, p=0.061 — same story, redundant after composite + hmm features.
+    # mom24: p=0.114 — marginal and correlated with mom12.
+    # vol_trend: p=0.276 — no signal.
 ]
 
 
@@ -580,12 +603,22 @@ def score_live(df, projections=None, live_hmm_label=None):
         except Exception:
             kelly_pct = 0
 
+        # ── ATR-based vol scaling: reduce size in high-vol regimes ──────────────
+        # atr_ratio > 1 = above-average volatility — same probability buys less edge
+        # Scale: 1.0x at normal vol, 0.5x at 2× vol, 0.33x at 3× vol (1/atr_ratio)
+        # Floor at 0.25x so we never size down more than 75% purely from vol
+        try:
+            _atr_ratio_live = float(row.get("atr_ratio", 1.0))
+            _vol_scalar = max(0.25, min(1.0, 1.0 / max(_atr_ratio_live, 0.5)))
+        except Exception:
+            _vol_scalar = 1.0
+
         # Tier ceiling caps Kelly (can't exceed max for that confidence band)
         tier_ceiling = {
             "BLOCKED": 0, "BLOCKED (SESSION)": 0, "PASS": 0, "WATCH": 0,
             "TRADE": 60, "HIGH CONVICTION": 80, "FULL SEND": 100,
         }
-        size_pct = min(kelly_pct, tier_ceiling.get(tier, 0))
+        size_pct = int(min(kelly_pct * _vol_scalar, tier_ceiling.get(tier, 0)))
 
         # ── Feature importance for component breakdown ────────────────────────
         fi      = model.feature_importances_

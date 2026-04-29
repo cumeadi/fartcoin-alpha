@@ -1,2 +1,3 @@
-timestamp,total_dex_liquidity_usd,total_dex_volume_24h_usd,weighted_price_usd,active_pools,top_dex,top_pool_liquidity
-2026-04-04T03:49:12.094908+00:00,8399598.47,2039101.58,0.1609,21,raydium,6546385.15
+timestamp,total_dex_liquidity_usd,total_dex_volume_24h_usd,weighted_price_usd,active_pools,top_dex,top_pool_liquidity,total_buys_24h,total_sells_24h,dex_buy_pct,is_weekend
+2026-04-04T03:49:12.094908+00:00,8399598.47,2039101.58,0.1609,21,raydium,6546385.15,,,,
+2026-04-29T05:08:39.846102+00:00,10873866.140000002,6139621.699999999,0.2096,25,raydium,7755560.29,14583.0,15049.0,0.4921,False

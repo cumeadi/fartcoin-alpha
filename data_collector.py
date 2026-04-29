@@ -24,6 +24,12 @@ DATA_DIR.mkdir(exist_ok=True)
 CMC_BASE = "https://pro-api.coinmarketcap.com"
 CG_BASE = "https://api.coingecko.com/api/v3"
 
+try:
+    from dex_collectors import fetch_dexscreener_data as _fetch_dex
+    _DEX_OK = True
+except Exception:
+    _DEX_OK = False
+
 
 def get_cmc_headers():
     api_key = os.environ.get("CMC_API_KEY")
@@ -445,6 +451,16 @@ def collect_all(cmc_symbol="FARTCOIN", perp_symbol="FARTCOINUSDT",
         print(f"\n  Real current avg funding rate: {real_fr:.6f}")
         print(f"  (Synthetic latest: {results['funding']['fundingRate'].dropna().iloc[-1]:.6f})")
 
+    # --- Step 5: DEX snapshot (DexScreener) ---
+    # Accumulates dex_buy_pct (on-chain buy/sell pressure) over time.
+    # Once ~60+ rows exist, dex_buy_pct becomes a testable training feature.
+    if _DEX_OK:
+        print("\n[5/5] Fetching DexScreener DEX snapshot...")
+        try:
+            _fetch_dex()
+        except Exception as _e:
+            print(f"  [DexScreener] Skipped: {_e}")
+
     print(f"\nAll data saved to {DATA_DIR}/")
     return results
 
@@ -454,7 +470,7 @@ def collect_all(cmc_symbol="FARTCOIN", perp_symbol="FARTCOINUSDT",
 # ---------------------------------------------------------------------------
 
 def poll_once(coin_filter="FARTCOIN"):
-    """Single poll of derivatives data — call this from a cron/scheduler."""
+    """Single poll of derivatives + DEX data — call this from a cron/scheduler."""
     print(f"[{datetime.utcnow().isoformat()}] Polling derivatives...")
     snapshot = fetch_cg_derivatives_tickers(coin_filter)
     if not snapshot.empty:
@@ -463,6 +479,14 @@ def poll_once(coin_filter="FARTCOIN"):
         print(f"  OI: ${analysis.get('total_oi_usd', 0):,.0f} | "
               f"Funding: {analysis.get('avg_funding_rate', 0):.6f} | "
               f"Basis: {analysis.get('avg_basis_pct', 0):.4f}%")
+
+    # DEX snapshot — accumulate dex_buy_pct for future feature use
+    if _DEX_OK:
+        try:
+            _fetch_dex()
+        except Exception as _e:
+            print(f"  [DexScreener] Skipped: {_e}")
+
     return snapshot
 
 

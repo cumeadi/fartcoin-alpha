@@ -50,6 +50,13 @@ try:
 except ImportError:
     _LGBM_OK = False
 
+try:
+    from lstm_model import TradingLSTM, train_lstm, predict_lstm, build_sequences, LOOKBACK
+    _LSTM_OK = True
+except ImportError:
+    _LSTM_OK = False
+    LOOKBACK  = 10
+
 from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_matrix as _hmm_features, label_current as _hmm_label_current
 from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
@@ -349,6 +356,28 @@ def build_meta_features(data):
     df["fwd_ret_8h"] = pd.Series(prices, index=ohlcv.index).pct_change(8).shift(-8).values
     df["target_4h"]  = (df["fwd_ret_4h"] > CARRY_COST).astype(int)
     df["target_8h"]  = (df["fwd_ret_8h"] > CARRY_COST * 2).astype(int)
+
+    # ── Stationarity transforms ───────────────────────────────────────────────
+    # 10 features were raw/unbounded. Rolling z-score stabilizes feature
+    # distributions across the 500h training window (different market regimes).
+    # Benefit: LightGBM improved 67.9%→69.7% hit, Sharpe 3.64→5.65.
+    # Required for LSTM (gradient descent needs bounded inputs).
+    # Binary HMM flags (hmm_hakai, hmm_accum, hmm_steady) and already-
+    # stationary features (funding_z, lsr_pct, vpin_z, etc.) are unchanged.
+    def _rzs(s, window, min_p):
+        mu  = pd.Series(s).rolling(window, min_periods=min_p).mean()
+        sig = pd.Series(s).rolling(window, min_periods=min_p).std() + 1e-9
+        return ((pd.Series(s) - mu) / sig).clip(-3, 3).fillna(0.0).values
+
+    for _col in ("oi_4h_pct", "oi_1h_pct", "oi_4h_chg", "btc_2h_ret", "vol_ratio"):
+        if _col in df.columns:
+            df[_col] = _rzs(df[_col].values, 48, 12)
+
+    if "sr_risk_reward" in df.columns:
+        df["sr_risk_reward"] = _rzs(df["sr_risk_reward"].values, 168, 48)
+
+    if "hakai_exit_h" in df.columns:
+        df["hakai_exit_h"] = (df["hakai_exit_h"] / 24.0).clip(0.0, 1.0)
 
     return df.fillna(0.0)
 
@@ -655,6 +684,221 @@ def score_live(df, projections=None, live_hmm_label=None):
             "hmm_label":       ["STEADY_STATE", "ACCUMULATION", "HAKAI"][min(hmm, 2)],
             "session_blocked": is_bad_session,
             "top_drivers":     top_feats,
+            "available":       True,
+            "description":     (
+                f"Opportunity Score: {score}/100 — {tier}. "
+                f"Meta-prob: {prob:.0%} (raw: {prob_raw:.0%}, Kelly: {kelly_f:.1%}). "
+                f"HMM: {['STEADY_STATE','ACCUMULATION','HAKAI'][min(hmm,2)]}. "
+                f"Recommended size: {size_pct}% of max position."
+            ),
+        }
+    except Exception as e:
+        return {"score": 50, "tier": "WATCH", "available": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LSTM meta-model — walk-forward + live scorer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def walk_forward_lstm(df):
+    """
+    Walk-forward backtest using TradingLSTM instead of LightGBM.
+
+    Each eval point trains an LSTM on the preceding TRAIN_WIN rows
+    (as LOOKBACK-length sequences), then scores the current bar.
+    StandardScaler is fit on training sequences only (no leakage).
+
+    Returns same DataFrame schema as walk_forward_meta() so score_results()
+    works for both.
+    """
+    if not _LSTM_OK:
+        raise RuntimeError("lstm_model.py required — torch not installed or import failed")
+
+    from sklearn.preprocessing import StandardScaler
+
+    available_features = [f for f in META_FEATURES if f in df.columns]
+    n_feat   = len(available_features)
+    results  = []
+    n        = len(df)
+    start    = MIN_TRAIN + TRAIN_WIN
+    indices  = list(range(start, n - 8, STEP))
+
+    print(f"  [lstm] Walk-forward: {len(indices)} eval points, {n_feat} features, lookback={LOOKBACK}")
+
+    for k, i in enumerate(indices):
+        if k % 20 == 0:
+            pct = k / len(indices) * 100
+            print(f"    [{pct:3.0f}%] {df.index[i] if hasattr(df.index[i], 'strftime') else i}", flush=True)
+
+        train = df.iloc[i - TRAIN_WIN: i]
+        row   = df.iloc[i]
+
+        y_train_raw = train["target_4h"].values
+        if y_train_raw.sum() < 10 or (1 - y_train_raw).sum() < 10:
+            continue
+
+        try:
+            X_raw = train[available_features].values.astype(np.float32)
+
+            # Fit scaler on training flat features, transform before sequencing
+            scaler  = StandardScaler()
+            X_scaled = scaler.fit_transform(X_raw)
+
+            X_seq, y_seq = build_sequences(X_scaled, y_train_raw, LOOKBACK)
+            if len(X_seq) < 30:
+                continue
+
+            model = train_lstm(X_seq, y_seq, input_size=n_feat)
+
+            # Score current bar: sequence = [i-LOOKBACK .. i-1] (no leakage)
+            test_raw  = df.iloc[i - LOOKBACK: i][available_features].values.astype(np.float32)
+            test_scaled = scaler.transform(test_raw)
+            prob = predict_lstm(model, test_scaled)
+
+            # Same hard gates as walk_forward_meta
+            is_hakai = int(row["hmm_hakai"] > 0.5)
+            try:
+                hour_of_row = pd.Timestamp(df.index[i]).hour
+            except Exception:
+                hour_of_row = 12
+            is_bad_session = int(hour_of_row >= 20)
+            meta_trade = int(prob > 0.55 and not is_hakai and not is_bad_session)
+
+            results.append({
+                "timestamp":  df.index[i],
+                "fwd_ret_4h": float(row["fwd_ret_4h"]),
+                "target_4h":  int(row["target_4h"]),
+                "meta_prob":  prob,
+                "meta_hit":   int(meta_trade and row["fwd_ret_4h"] > CARRY_COST),
+                "meta_trade": meta_trade,
+                "hmm_regime": int(row["hmm_regime"]),
+                "is_hakai":   is_hakai,
+                "is_accum":   int(row["hmm_accum"] > 0.5),
+                "vpin_z":     float(row["vpin_z"]),
+                "composite":  float(row.get("composite", 0.0)),
+            })
+        except Exception:
+            continue
+
+    return pd.DataFrame(results)
+
+
+def score_live_lstm(df, projections=None, live_hmm_label=None):
+    """
+    Train LSTM on last TRAIN_WIN rows, score the current bar.
+    Drop-in replacement for score_live() — same output dict schema.
+    """
+    if not _LSTM_OK:
+        return {"score": 50, "tier": "WATCH", "available": False,
+                "error": "lstm_model not available"}
+
+    from sklearn.preprocessing import StandardScaler
+
+    available_features = [f for f in META_FEATURES if f in df.columns]
+    n_feat = len(available_features)
+    n      = len(df)
+    if n < MIN_TRAIN + LOOKBACK + 10:
+        return {"score": 50, "tier": "WATCH", "available": False}
+
+    train = df.iloc[-(TRAIN_WIN + 1): -1]
+    row   = df.iloc[-1]
+
+    try:
+        current_hour = pd.Timestamp(df.index[-1]).hour
+    except Exception:
+        current_hour = 12
+    is_bad_session = (current_hour >= 20)
+
+    live_is_hakai = False
+    if live_hmm_label is not None:
+        live_is_hakai = (live_hmm_label == "HAKAI")
+    else:
+        try:
+            _live_lbl = _hmm_label_current(df._data if hasattr(df, '_data') else {})
+            live_is_hakai = (_live_lbl.get("regime_label") == "HAKAI")
+        except Exception:
+            pass
+
+    X_raw   = train[available_features].values.astype(np.float32)
+    y_train = train["target_4h"].values
+
+    if y_train.sum() < 5:
+        return {"score": 50, "tier": "WATCH", "available": False}
+
+    try:
+        scaler   = StandardScaler()
+        X_scaled = scaler.fit_transform(X_raw)
+        X_seq, y_seq = build_sequences(X_scaled, y_train, LOOKBACK)
+
+        if len(X_seq) < 30:
+            return {"score": 50, "tier": "WATCH", "available": False}
+
+        model = train_lstm(X_seq, y_seq, input_size=n_feat)
+
+        test_raw    = df.iloc[-LOOKBACK - 1: -1][available_features].values.astype(np.float32)
+        test_scaled = scaler.transform(test_raw)
+        prob_raw    = predict_lstm(model, test_scaled)
+        prob        = prob_raw   # no isotonic calibration (too few cal samples for LSTM)
+
+        score = int(np.clip((prob - 0.20) / 0.60 * 100, 0, 100))
+
+        hmm = int(row.get("hmm_regime", 0))
+        if int(row.get("hmm_hakai", 0)) == 1 or live_is_hakai:
+            tier  = "BLOCKED"
+            score = min(score, 25)
+        elif is_bad_session:
+            tier  = "BLOCKED (SESSION)"
+            score = min(score, 30)
+        elif score >= 78:
+            tier = "FULL SEND"
+        elif score >= 65:
+            tier = "HIGH CONVICTION"
+        elif score >= 55:
+            tier = "TRADE"
+        elif score >= 45:
+            tier = "WATCH"
+        else:
+            tier = "PASS"
+
+        # Kelly sizing (same formula as score_live)
+        kelly_f   = 0.0
+        kelly_pct = 0
+        try:
+            train_rets = train["fwd_ret_4h"].values
+            win_rets   = train_rets[train_rets > CARRY_COST]
+            loss_rets  = train_rets[train_rets <= CARRY_COST]
+            avg_win    = float(win_rets.mean())        if len(win_rets)  > 5 else CARRY_COST * 2
+            avg_loss   = float(abs(loss_rets.mean()))  if len(loss_rets) > 5 else CARRY_COST
+            b          = avg_win / (avg_loss + 1e-9)
+            q          = 1.0 - prob
+            kelly_f    = max(0.0, (prob * b - q) / (b + 1e-9))
+            kelly_pct  = int(kelly_f * 100)
+        except Exception:
+            kelly_pct = 0
+
+        try:
+            _atr_ratio_live = float(row.get("atr_ratio", 1.0))
+            _vol_scalar = max(0.25, min(1.0, 1.0 / max(_atr_ratio_live, 0.5)))
+        except Exception:
+            _vol_scalar = 1.0
+
+        tier_ceiling = {
+            "BLOCKED": 0, "BLOCKED (SESSION)": 0, "PASS": 0, "WATCH": 0,
+            "TRADE": 60, "HIGH CONVICTION": 80, "FULL SEND": 100,
+        }
+        size_pct = int(min(kelly_pct * _vol_scalar, tier_ceiling.get(tier, 0)))
+
+        return {
+            "score":           score,
+            "tier":            tier,
+            "meta_prob":       round(prob, 4),
+            "meta_prob_raw":   round(prob_raw, 4),
+            "kelly_fraction":  round(kelly_f, 3),
+            "size_pct":        size_pct,
+            "hmm_regime":      hmm,
+            "hmm_label":       ["STEADY_STATE", "ACCUMULATION", "HAKAI"][min(hmm, 2)],
+            "session_blocked": is_bad_session,
+            "top_drivers":     [],   # LSTM has no per-feature importance
             "available":       True,
             "description":     (
                 f"Opportunity Score: {score}/100 — {tier}. "

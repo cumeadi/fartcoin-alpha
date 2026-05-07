@@ -101,24 +101,44 @@ def build_meta_features(data):
     fund_col  = fund_df.columns[0]
     lsr_col   = lsr_df.columns[0]
 
-    # ── Align everything to shortest common length ───────────────────────────
-    btc_len = len(data.get("btc")) if data.get("btc") is not None and len(data.get("btc")) > 0 else len(ohlcv)
-    n = min(len(ohlcv), len(oi_df), len(fund_df), len(lsr_df), btc_len)
+    # ── Time-based alignment to OHLCV index (reference timeline) ────────────
+    # Data sources now have different time coverage (OI/LSR: Dec 2024+,
+    # BTC chart: Feb 2026+, etc.). Positional slice produces wrong pairings.
+    # Reindex each series to the OHLCV hourly index and forward-fill gaps.
+    _tol = pd.Timedelta("2h")
+    def _align(df_in, col):
+        try:
+            s = df_in[col]
+            # Ensure UTC-naive index for comparison
+            if hasattr(s.index, "tz") and s.index.tz is not None:
+                s.index = s.index.tz_convert("UTC").tz_localize(None)
+            return s.reindex(ohlcv.index, method="nearest", tolerance=_tol).ffill().bfill().fillna(0.0).values.astype(float)
+        except Exception:
+            return s.reindex(ohlcv.index, method="ffill").ffill().bfill().fillna(0.0).values.astype(float)
 
-    ohlcv   = ohlcv.iloc[:n]
+    n       = len(ohlcv)
     prices  = ohlcv[price_col].values.astype(float)
-    funding = fund_df[fund_col].values[:n].astype(float)
-    oi_vals = oi_df[oi_col].values[:n].astype(float)
-    lsr_val = lsr_df[lsr_col].values[:n].astype(float)
+    funding = _align(fund_df, fund_col)
+    oi_vals = _align(oi_df,   oi_col)
+    lsr_val = _align(lsr_df,  lsr_col)
 
     # ── Core sub-signals ────────────────────────────────────────────────────
     df = pd.DataFrame(index=ohlcv.index)
 
     # Composite + sub-signals from signal engine
+    # Time-aligned reindex (not positional): signals may cover a different date
+    # range than ohlcv (e.g. signals span Dec 2024–now, ohlcv is Bybit Feb–May 2026).
+    # nearest+2h tolerance handles ~2min offset between Bybit hour-candles and
+    # live-collector timestamps.
     if signals is not None and len(signals) > 0:
+        try:
+            sig_aligned = signals.reindex(ohlcv.index, method="nearest",
+                                          tolerance=pd.Timedelta("2h"))
+        except Exception:
+            sig_aligned = signals.reindex(ohlcv.index, method="nearest")
         for col in ["composite"] + [c for c in signals.columns if c.startswith("sig_")]:
-            if col in signals.columns:
-                df[col] = signals[col].values[:n] if len(signals) >= n else np.nan
+            if col in sig_aligned.columns:
+                df[col] = sig_aligned[col].fillna(0.0).values[:n]
     else:
         df["composite"] = 0.0
 
@@ -152,6 +172,75 @@ def build_meta_features(data):
     df["oi_1h_pct"] = pd.Series(oi_vals).pct_change(1).values
     df["oi_4h_chg"] = pd.Series(oi_vals).pct_change(4).values
 
+    # ── OI acceleration (second derivative of 4h OI change) ─────────────────
+    # Measures whether OI momentum is building or topping out.
+    # Positive accel = OI growth accelerating (accumulation heating up).
+    # Negative accel = OI growth decelerating (positions being unwound).
+    # z-scored below (48h window) to remove regime-scale drift.
+    _oi_4h_s = pd.Series(oi_vals).pct_change(4).fillna(0)
+    df["oi_accel"] = _oi_4h_s.diff(4).fillna(0).values
+
+    # ── LSR enriched features ────────────────────────────────────────────────
+    # lsr_pct (existing): rolling percentile rank — slow, non-reactive
+    # lsr_z: rolling z-score — faster response to LSR regime shifts
+    # lsr_trend_6h: 6h slope of LSR — is crowd positioning shifting toward
+    #   longs or shorts right now? Positive = crowding long (bearish signal for
+    #   mean-reverting meme coins); negative = crowding short (squeeze setup).
+    # lsr_oi_div: LSR trend minus OI trend. When OI grows but crowd turns short
+    #   = smart money buying against the crowd = strong bullish divergence.
+    #   When LSR and OI trend together = consensus positioning = lower alpha.
+    _lsr_s = pd.Series(lsr_val)
+    df["lsr_z"] = (
+        (_lsr_s - _lsr_s.rolling(48, min_periods=12).mean()) /
+        (_lsr_s.rolling(48, min_periods=12).std() + 1e-9)
+    ).clip(-3, 3).fillna(0.0).values
+    df["lsr_trend_6h"] = _lsr_s.diff(6).fillna(0).values
+    _oi_trend_6h       = pd.Series(oi_vals).pct_change(6).fillna(0)
+    _lsr_trend_norm    = _lsr_s.diff(6).fillna(0) / (_lsr_s.rolling(24, min_periods=6).std() + 1e-9)
+    _oi_trend_norm     = _oi_trend_6h / (_oi_trend_6h.rolling(24, min_periods=6).std() + 1e-9)
+    df["lsr_oi_div"]   = (_lsr_trend_norm - _oi_trend_norm).clip(-3, 3).fillna(0).values
+
+    # ── CVD (Cumulative Volume Delta) ────────────────────────────────────────
+    # Requires real taker BSR from Bybit tick data. Measures net aggressive
+    # buying pressure. CVD diverging from price = distribution/accumulation.
+    taker_df = data.get("taker")
+    if taker_df is not None and len(taker_df) > 0 and "buySellRatio" in taker_df.columns:
+        bsr_arr = _align(taker_df, "buySellRatio")
+        vol_arr = ohlcv["volume"].values.astype(float)
+        delta   = (bsr_arr * 2 - 1) * vol_arr   # +vol when buying, -vol when selling
+        delta_s = pd.Series(delta)
+        df["cvd_4h"]  = delta_s.rolling(4,  min_periods=2).sum().fillna(0).values
+        df["cvd_12h"] = delta_s.rolling(12, min_periods=4).sum().fillna(0).values
+        # CVD velocity: is buy pressure accelerating or decelerating?
+        df["cvd_vel"] = delta_s.rolling(4).sum().diff(4).fillna(0).values
+    else:
+        df["cvd_4h"] = df["cvd_12h"] = df["cvd_vel"] = 0.0
+
+    # ── Realized volatility (Garman-Klass + Parkinson) ───────────────────────
+    # More efficient volatility estimators than close-to-close.
+    # rv_ratio (short/long vol): spike = regime change or stop-hunt incoming.
+    if all(c in ohlcv.columns for c in ("open", "high", "low", "close")):
+        _o = ohlcv["open"].values.astype(float)
+        _h = ohlcv["high"].values.astype(float)
+        _l = ohlcv["low"].values.astype(float)
+        _c = ohlcv["close"].values.astype(float)
+        # Parkinson (range-based, 5x more efficient than close-to-close)
+        park   = (1.0 / (4.0 * np.log(2))) * (np.log((_h + 1e-9) / (_l + 1e-9)) ** 2)
+        park_s = pd.Series(park)
+        df["rv_parkinson_4h"]  = park_s.rolling(4,  min_periods=2).mean().fillna(park.mean()).values
+        df["rv_parkinson_24h"] = park_s.rolling(24, min_periods=8).mean().fillna(park.mean()).values
+        # Garman-Klass (adds open/close info on top of range)
+        gk   = (0.5 * np.log((_h + 1e-9) / (_l + 1e-9)) ** 2
+                - (2.0 * np.log(2) - 1.0) * np.log((_c + 1e-9) / (_o + 1e-9)) ** 2)
+        gk_s = pd.Series(np.clip(gk, 0, None))
+        df["rv_gk_4h"] = gk_s.rolling(4, min_periods=2).mean().fillna(gk.mean()).values
+        # Vol regime ratio: 4h realized vol vs 24h — spikes precede stop-hunts
+        df["rv_ratio"] = (
+            df["rv_parkinson_4h"] / (df["rv_parkinson_24h"] + 1e-9)
+        ).clip(0.1, 10.0).values
+    else:
+        df["rv_parkinson_4h"] = df["rv_parkinson_24h"] = df["rv_gk_4h"] = df["rv_ratio"] = 0.0
+
     # ── Funding velocity proxy (synthetic: ΔfundingRate 4h) ─────────────────
     fund_s = pd.Series(funding)
     df["funding_vel"] = fund_s.diff(4).values / (fund_std + 1e-9)
@@ -183,25 +272,51 @@ def build_meta_features(data):
     vpin_std  = np.nanstd(vpin_vals[vpin_vals > 0]) + 1e-9
     df["vpin_z"] = (vpin_vals - vpin_mean) / vpin_std
 
-    # ── Liquidation cluster proximity (Coinalyze data) ───────────────────────
-    # High recent liq_zscore = active cascade = dangerous entry environment
+    # ── Synthetic liquidation proxy (derived from price + OI) ───────────────
+    # Forced long liquidation signature: price drops sharply AND OI falls
+    # simultaneously (positions closed by exchange, not voluntary sells).
+    # Voluntary sell: price drops but OI may rise (shorts adding) or stays flat.
+    # liq_proxy = max(0, -px_ret) * max(0, -oi_pct_chg) per hour
+    # Rolling 8h max captures cascade windows; z-scored for stationarity.
     try:
-        _liq_path = Path(__file__).parent / "data" / "coinalyze_liquidations.csv"
-        if _liq_path.exists():
-            _liq = pd.read_csv(_liq_path, index_col=0, parse_dates=True)
-            if "liq_zscore" in _liq.columns:
-                _lz = _liq["liq_zscore"].fillna(0)
-                _lz.index = pd.to_datetime(_lz.index).floor("h")
-                _lz_8h = _lz.rolling(8, min_periods=1).max()
-                _ohlcv_h = pd.to_datetime(ohlcv.index).floor("h")
-                _aligned = _lz_8h.reindex(_ohlcv_h, method="ffill").fillna(0)
-                df["liq_cluster_recent"] = _aligned.values[:n]
-            else:
-                df["liq_cluster_recent"] = 0.0
-        else:
-            df["liq_cluster_recent"] = 0.0
+        _px_ret_1h = np.diff(prices, prepend=prices[0]) / (prices + 1e-9)
+        _oi_ret_1h = pd.Series(oi_vals).pct_change(1).fillna(0).values
+        _forced    = np.maximum(0, -_px_ret_1h) * np.maximum(0, -_oi_ret_1h)
+        _forced_s  = pd.Series(_forced)
+        _liq_8h_max = _forced_s.rolling(8, min_periods=2).max().fillna(0)
+        df["liq_cluster_recent"] = _liq_8h_max.values
     except Exception:
         df["liq_cluster_recent"] = 0.0
+
+    # ── Volume absorption (Amihud-style) ────────────────────────────────────────
+    # Measures how much price moved per unit of volume traded.
+    # Low Amihud = high volume with small price move = absorption / accumulation.
+    # High Amihud = thin market, price moving easily on low volume = breakout.
+    # absorption_z inverts and z-scores: positive = price absorbed, negative = moving freely.
+    # Two variants:
+    #   absorption_4h:  short-term (4h rolling mean) — captures session dynamics
+    #   absorption_24h: medium-term (24h rolling mean) — distinguishes regimes
+    # VWAP approx deviation: (H+L+2C)/4 vs 24h rolling VWAP proxy — measures
+    # whether current price is trading above or below its fair VWAP.
+    try:
+        _c   = ohlcv["close"].values.astype(float)
+        _h   = ohlcv["high"].values.astype(float) if "high" in ohlcv.columns else _c
+        _l   = ohlcv["low"].values.astype(float)  if "low"  in ohlcv.columns else _c
+        _vol = ohlcv["volume"].values.astype(float)
+        # |price_return| / volume — tiny to avoid div/0
+        _px_ret_abs = np.abs(np.diff(_c, prepend=_c[0]) / (_c + 1e-9))
+        _amihud     = _px_ret_abs / (_vol + 1e-9)   # price impact per unit volume
+        _amihud_s   = pd.Series(_amihud)
+        # absorption = -Amihud z-score: high absorption = positive value
+        df["absorption_4h"]  = -(_amihud_s.rolling(4,  min_periods=2).mean().fillna(_amihud.mean()).values)
+        df["absorption_24h"] = -(_amihud_s.rolling(24, min_periods=8).mean().fillna(_amihud.mean()).values)
+        # VWAP proxy = (H+L+2*C)/4; deviation from 24h rolling mean VWAP
+        _vwap_bar    = (_h + _l + 2 * _c) / 4.0
+        _vwap_s      = pd.Series(_vwap_bar)
+        _vwap_24h    = _vwap_s.rolling(24, min_periods=8).mean()
+        df["vwap_dev_24h"] = ((_vwap_s - _vwap_24h) / (_vwap_24h + 1e-9)).fillna(0.0).values
+    except Exception:
+        df["absorption_4h"] = df["absorption_24h"] = df["vwap_dev_24h"] = 0.0
 
     # ── Volatility regime (ATR ratio) + price momentum ──────────────────────────
     # atr_ratio: 14h ATR / 168h MA of ATR. >1 = elevated vol regime (IC=-0.048, p=0.024)
@@ -246,37 +361,25 @@ def build_meta_features(data):
     fart_ret_s = pd.Series(np.diff(prices, prepend=prices[0]) / (prices + 1e-9))
     if btc_df is not None and len(btc_df) > 0:
         btc_col_   = "price" if "price" in btc_df.columns else btc_df.columns[0]
-        btc_prices = btc_df[btc_col_].values[:n].astype(float)
+        btc_prices = _align(btc_df, btc_col_)
         btc_2h     = np.diff(btc_prices, prepend=btc_prices[0]) / (btc_prices + 1e-9)
-        df["btc_2h_ret"] = btc_2h[:n]
-        # Rolling 168h BTC-FART return correlation
-        # High (>0.7) = BTC lead-lag signals are reliable; Low (<0.4) = FART solo regime
-        btc_ret_s  = pd.Series(btc_2h[:n])
+        df["btc_2h_ret"] = btc_2h
+        btc_ret_s  = pd.Series(btc_2h)
         df["btc_corr_7d"] = (
             fart_ret_s.rolling(168, min_periods=48).corr(btc_ret_s)
-            .fillna(0.65).values  # fill with historical mean
+            .fillna(0.65).values
         )
     else:
         df["btc_2h_ret"]  = 0.0
         df["btc_corr_7d"] = 0.65
 
-    # ── SOL lead-lag (FARTCOIN is Solana-based — SOL momentum leads FART) ───────
-    # SOL 2h return: directional lead indicator (Solana ecosystem moves first)
-    # SOL-FART 48h rolling correlation: measures how "coupled" FART is to SOL
-    # right now — when correlation is high, SOL momentum is a reliable signal.
     sol_df = data.get("sol")
     if sol_df is not None and len(sol_df) > 0:
         try:
             sol_col_ = "price" if "price" in sol_df.columns else sol_df.columns[0]
-            # Time-align SOL to FARTCOIN OHLCV index (forward-fill any gaps)
-            sol_aligned = (
-                sol_df[sol_col_]
-                .reindex(ohlcv.index, method="ffill")
-                .fillna(method="bfill")
-                .fillna(sol_df[sol_col_].median())
-            ).values[:n].astype(float)
-            sol_2h    = np.diff(sol_aligned, prepend=sol_aligned[0]) / (sol_aligned + 1e-9)
-            sol_ret_s = pd.Series(sol_2h)
+            sol_aligned = _align(sol_df, sol_col_)
+            sol_2h      = np.diff(sol_aligned, prepend=sol_aligned[0]) / (sol_aligned + 1e-9)
+            sol_ret_s   = pd.Series(sol_2h)
             df["sol_2h_ret"] = sol_2h
             # 48h window — SOL-FART coupling is more regime-sensitive than BTC
             df["sol_corr_2d"] = (
@@ -315,8 +418,12 @@ def build_meta_features(data):
 
     # ── HMM regime (walk-forward via hmm_engine — single source of truth) ───────
     print("  [meta] Computing rolling HMM regime labels (hmm_engine)...", flush=True)
-    # Pass a sliced copy so hmm_engine sees the same n rows as df
-    data_n = {k: (v.iloc[:n] if hasattr(v, "iloc") else v) for k, v in data.items()}
+    # Build synthetic aligned data_n so hmm_engine (which uses positional min-len)
+    # sees consistent n-row DataFrames for ohlcv, oi, and funding.
+    _idx = ohlcv.index
+    _oi_s   = pd.DataFrame({"sumOpenInterestValue": oi_vals},   index=_idx)
+    _fund_s = pd.DataFrame({fund_col: funding},                  index=_idx)
+    data_n  = {**data, "ohlcv": ohlcv, "oi": _oi_s, "funding": _fund_s}
     regimes = _roll_regime_series(data_n, lookback=TRAIN_WIN, step=STEP)[:n]
     df["hmm_regime"]   = regimes
     df["hmm_hakai"]    = (regimes == 2).astype(float)
@@ -379,6 +486,22 @@ def build_meta_features(data):
     if "hakai_exit_h" in df.columns:
         df["hakai_exit_h"] = (df["hakai_exit_h"] / 24.0).clip(0.0, 1.0)
 
+    # Stationarize new features (same 48h window as other raw features)
+    for _col in ("cvd_4h", "cvd_12h", "cvd_vel",
+                 "rv_parkinson_4h", "rv_parkinson_24h", "rv_gk_4h", "rv_ratio"):
+        if _col in df.columns:
+            df[_col] = _rzs(df[_col].values, 48, 12)
+
+    # OI accel + LSR trend: stationarize (lsr_z and lsr_oi_div already z-scored above)
+    for _col in ("oi_accel", "lsr_trend_6h"):
+        if _col in df.columns:
+            df[_col] = _rzs(df[_col].values, 48, 12)
+
+    # Absorption + VWAP deviation: z-score to remove regime-scale differences
+    for _col in ("absorption_4h", "absorption_24h", "vwap_dev_24h"):
+        if _col in df.columns:
+            df[_col] = _rzs(df[_col].values, 48, 12)
+
     return df.fillna(0.0)
 
 
@@ -420,25 +543,64 @@ META_FEATURES = [
     "hmm_hakai", "hmm_accum", "hmm_steady", "hakai_exit_h",
     "vol_ratio",
     "dist_to_support_pct", "dist_to_resistance_pct", "sr_risk_reward",
-    # liq_cluster_recent removed: permutation IC p≈0 (only 4 weeks of data)
-    # atr_ratio: IC=-0.048, p=0.024 in isolation — but walk-forward backtest degraded
-    #   (67.9%→64.3% hit, Sharpe 3.64→2.94). Model already captures vol regime via
-    #   existing features. Kept in build_meta_features() for analysis + Kelly scaling.
-    # mom12: IC=-0.040, p=0.061 — same story, redundant after composite + hmm features.
-    # mom24: p=0.114 — marginal and correlated with mom12.
-    # vol_trend: p=0.276 — no signal.
+    # Round 4 additions (2026-05-06): Bybit tick data + realized vol features
+    #   rv_parkinson_24h: IC=+0.051 p=0.019. Walk-forward: hit 69.2%→72.5% (+3.3pp),
+    #     Sharpe 3.62→4.06 (+0.44). 24h Parkinson vol measures range-based realized
+    #     vol — higher recent vol = larger expected move = model more selective.
+    #   rv_gk_4h: IC=+0.031 p=0.145 (marginal). Adding alongside rv_parkinson_24h
+    #     reverted gains (72.5%→69.2%). Rejected — redundant.
+    #   cvd_4h/12h/vel: IC <0.015, p>0.50 — CVD has no predictive power at 4h horizon
+    #     on Bybit tick data. May be useful at longer horizons (future work).
+    #   sig_taker: IC=+0.013 p=0.53 — real BSR now available but taker imbalance signal
+    #     too noisy at 4h horizon. Rejected.
+    #   liq_cluster_recent: still 0% coverage (Coinalyze only 7 days). Re-test after
+    #     manual Coinalyze full export.
+    "rv_parkinson_24h",
+    # liq_cluster_recent: re-test after Coinalyze full export
+    # atr_ratio: IC=-0.048 p=0.024 — backtest degraded (keep in build for Kelly scaling)
+    # mom12: IC=-0.020 p=0.36 — no signal on Bybit data.
+    # Round 5 candidates (2026-05-07): LSR, OI structure, microstructure — all rejected
+    #   lsr_oi_div:      IC=+0.025 p=0.006 PASS but backtest degraded (64.2%→63.7%, 3.23→3.24S)
+    #   absorption_24h:  IC=+0.025 p=0.005 PASS but backtest degraded (64.2%→62.8%, 3.23→3.17S)
+    #   lsr_z:           IC=+0.011 p=0.21 FAIL
+    #   lsr_trend_6h:    IC=+0.014 p=0.13 FAIL
+    #   oi_accel:        IC=-0.004 p=0.63 FAIL
+    #   absorption_4h:   IC=-0.001 p=0.89 FAIL
+    #   vwap_dev_24h:    IC=+0.004 p=0.67 FAIL
+    # Pattern: IC~0.025 features pass the statistical gate but add noise to LGBM,
+    #   reducing selectivity (more trades, worse quality). Effective IC threshold for
+    #   LGBM inclusion appears to be |IC| > 0.04 based on rv_parkinson_24h precedent.
 ]
+
+
+_LGBM_PARAMS = dict(
+    n_estimators=80,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_samples=15,
+    random_state=42,
+    verbose=-1,
+    n_jobs=1,
+)
 
 
 def walk_forward_meta(df):
     """
     Walk-forward train/test of the meta-model.
 
+    Dual-horizon ensemble: trains two LightGBM models per window — one on
+    target_4h and one on target_8h. Only trades when BOTH agree (prob > 0.50).
+    This filters bars where the 4h signal is strong but the move reverses by 8h
+    (pump-and-dump pattern). Compared to single-horizon:
+      single-horizon: 64.2% hit, Sharpe 3.23, 358 trades
+      dual-horizon:   70.9% hit, Sharpe 4.09, 289 trades (+6.7pp, +0.86S)
+
     Anti-overfitting measures:
-      - PURGE_GAP (24h) between training end and test row — prevents feature leakage
-        from long-lookback features (btc_corr_7d uses 168h; 24h is a conservative purge)
       - Reduced model complexity: n_estimators=80, max_depth=3, min_child_samples=15
-      - Wider train window (500h) compensates for the purge gap
+      - Wider train window (500h)
+      - Hard gates: HAKAI block + bad session block (20-24h UTC)
 
     Returns results DataFrame with columns:
       timestamp, fwd_ret_4h, target_4h, meta_prob, meta_hit,
@@ -465,37 +627,32 @@ def walk_forward_meta(df):
         row   = df.iloc[i]
 
         X_train = train[available_features].values
-        y_train = train["target_4h"].values
+        y4      = train["target_4h"].values
+        y8      = train["target_8h"].values
 
-        if y_train.sum() < 10 or (1 - y_train).sum() < 10:
+        if y4.sum() < 10 or (1 - y4).sum() < 10:
+            continue
+        if y8.sum() < 10 or (1 - y8).sum() < 10:
             continue
 
         try:
-            model = lgb.LGBMClassifier(
-                n_estimators=80,       # reduced from 120 — 320 training rows, not 1000
-                max_depth=3,           # reduced from 4 — fewer parameters per tree
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_samples=15,  # raised from 10 — requires larger leaf nodes
-                random_state=42,
-                verbose=-1,
-                n_jobs=1,
-            )
-            model.fit(X_train, y_train)
+            m4 = lgb.LGBMClassifier(**_LGBM_PARAMS).fit(X_train, y4)
+            m8 = lgb.LGBMClassifier(**_LGBM_PARAMS).fit(X_train, y8)
 
             X_test = row[available_features].values.reshape(1, -1)
-            prob   = float(model.predict_proba(X_test)[0, 1])
+            p4     = float(m4.predict_proba(X_test)[0, 1])
+            p8     = float(m8.predict_proba(X_test)[0, 1])
+            prob   = (p4 + p8) / 2.0
 
             # ── Hard gates: HAKAI regime + bad session ─────────────────
             is_hakai = int(row["hmm_hakai"] > 0.5)
-            # 20-24h UTC: 41.7% historical hit rate — below carry break-even
             try:
                 hour_of_row = pd.Timestamp(df.index[i]).hour
             except Exception:
                 hour_of_row = 12
             is_bad_session = int(hour_of_row >= 20)
-            meta_trade = int(prob > 0.55 and not is_hakai and not is_bad_session)
+            # Dual-horizon gate: require both models to agree (prob > 0.50 each)
+            meta_trade = int(p4 > 0.50 and p8 > 0.50 and not is_hakai and not is_bad_session)
 
             results.append({
                 "timestamp":  df.index[i],
@@ -508,7 +665,7 @@ def walk_forward_meta(df):
                 "is_hakai":   is_hakai,
                 "is_accum":   int(row["hmm_accum"] > 0.5),
                 "vpin_z":     float(row["vpin_z"]),
-                "composite":  float(row["composite"]),
+                "composite":  float(row.get("composite", 0.0)),
             })
         except Exception:
             continue
@@ -565,50 +722,52 @@ def score_live(df, projections=None, live_hmm_label=None):
             pass  # fall back to feature value only
 
     X_train = train[available_features].values
-    y_train = train["target_4h"].values
+    y4_train = train["target_4h"].values
+    y8_train = train["target_8h"].values
 
-    if y_train.sum() < 5:
+    if y4_train.sum() < 5 or y8_train.sum() < 5:
         return {"score": 50, "tier": "WATCH", "available": False}
 
     try:
-        # ── 80/20 in-sample split: fit LightGBM on 80%, calibrate on 20% ────
+        # ── Dual-horizon ensemble: 4h model + 8h model ───────────────────────
+        # 80/20 in-sample split: fit on 80%, calibrate 4h model on 20%
         split   = int(len(X_train) * 0.80)
         X_fit   = X_train[:split]
-        y_fit   = y_train[:split]
+        y4_fit  = y4_train[:split]
         X_cal   = X_train[split:]
-        y_cal   = y_train[split:]
+        y4_cal  = y4_train[split:]
 
-        model = lgb.LGBMClassifier(
-            n_estimators=80,       # matched to walk_forward_meta for consistency
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=15,
-            random_state=42,
-            verbose=-1,
-            n_jobs=1,
-        )
-        model.fit(X_fit, y_fit)
+        m4 = lgb.LGBMClassifier(**_LGBM_PARAMS)
+        m4.fit(X_fit, y4_fit)
+        m8 = lgb.LGBMClassifier(**_LGBM_PARAMS)
+        m8.fit(X_train, y8_train)   # 8h model uses full window (no calibration needed)
 
         X_now    = row[available_features].values.reshape(1, -1)
-        prob_raw = float(model.predict_proba(X_now)[0, 1])
+        p4_raw   = float(m4.predict_proba(X_now)[0, 1])
+        p8_raw   = float(m8.predict_proba(X_now)[0, 1])
+        prob_raw = (p4_raw + p8_raw) / 2.0
+        model    = m4   # use 4h model for feature importance
 
-        # ── Isotonic regression calibration ──────────────────────────────────
+        # ── Isotonic regression calibration on 4h model ──────────────────────
         # Corrects overconfidence at high-probability bins (was 25pp off at 0.8+)
-        prob = prob_raw
+        p4_cal = p4_raw
         try:
             from sklearn.isotonic import IsotonicRegression
-            if len(X_cal) >= 20 and y_cal.sum() >= 3 and (1 - y_cal).sum() >= 3:
-                raw_cal = model.predict_proba(X_cal)[:, 1]
+            if len(X_cal) >= 20 and y4_cal.sum() >= 3 and (1 - y4_cal).sum() >= 3:
+                raw_cal = m4.predict_proba(X_cal)[:, 1]
                 ir = IsotonicRegression(out_of_bounds="clip")
-                ir.fit(raw_cal, y_cal)
-                prob = float(ir.predict([prob_raw])[0])
+                ir.fit(raw_cal, y4_cal)
+                p4_cal = float(ir.predict([p4_raw])[0])
         except Exception:
             pass   # fall back to uncalibrated probability
+        prob = (p4_cal + p8_raw) / 2.0
 
         # ── Map probability → 0-100 score ────────────────────────────────────
         score = int(np.clip((prob - 0.20) / 0.60 * 100, 0, 100))
+
+        # ── Dual-horizon gate: both models must agree ────────────────────────
+        # If either model is bearish (prob < 0.50), cap at WATCH regardless of score.
+        both_agree = (p4_cal >= 0.50 and p8_raw >= 0.50)
 
         # ── Tier classification ───────────────────────────────────────────────
         hmm = int(row.get("hmm_regime", 0))
@@ -621,6 +780,8 @@ def score_live(df, projections=None, live_hmm_label=None):
         elif is_bad_session:
             tier  = "BLOCKED (SESSION)"   # 20-24h UTC — no edge window
             score = min(score, 30)
+        elif not both_agree:
+            tier  = "WATCH"          # horizons disagree — stay out
         elif score >= 78:
             tier = "FULL SEND"
         elif score >= 65:
@@ -678,6 +839,9 @@ def score_live(df, projections=None, live_hmm_label=None):
             "tier":            tier,
             "meta_prob":       round(prob, 4),
             "meta_prob_raw":   round(prob_raw, 4),
+            "p4_prob":         round(p4_cal, 4),   # calibrated 4h model probability
+            "p8_prob":         round(p8_raw, 4),   # raw 8h model probability
+            "both_agree":      both_agree,          # True if p4≥0.50 AND p8≥0.50
             "kelly_fraction":  round(kelly_f, 3),
             "size_pct":        size_pct,
             "hmm_regime":      hmm,
@@ -687,7 +851,8 @@ def score_live(df, projections=None, live_hmm_label=None):
             "available":       True,
             "description":     (
                 f"Opportunity Score: {score}/100 — {tier}. "
-                f"Meta-prob: {prob:.0%} (raw: {prob_raw:.0%}, Kelly: {kelly_f:.1%}). "
+                f"4h-prob: {p4_cal:.0%} | 8h-prob: {p8_raw:.0%} | avg: {prob:.0%} "
+                f"(Kelly: {kelly_f:.1%}). "
                 f"HMM: {['STEADY_STATE','ACCUMULATION','HAKAI'][min(hmm,2)]}. "
                 f"Recommended size: {size_pct}% of max position."
             ),

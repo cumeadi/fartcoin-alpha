@@ -190,12 +190,15 @@ opp        = proj.get("opportunity", {})
 _hmm       = proj.get("hmm_regime", {})
 _sr        = proj.get("support_resistance", {})
 
-_score     = opp.get("score", 0)
-_tier      = opp.get("tier", "WATCH")
-_size_pct  = opp.get("size_pct", 0)
-_kelly_f   = opp.get("kelly_fraction", 0)
-_meta_prob = opp.get("meta_prob", 0.5)
-_top_drv   = opp.get("top_drivers", [])
+_score      = opp.get("score", 0)
+_tier       = opp.get("tier", "WATCH")
+_size_pct   = opp.get("size_pct", 0)
+_kelly_f    = opp.get("kelly_fraction", 0)
+_meta_prob  = opp.get("meta_prob", 0.5)
+_top_drv    = opp.get("top_drivers", [])
+_p4_prob    = opp.get("p4_prob")    # 4h model probability (None if legacy/unavailable)
+_p8_prob    = opp.get("p8_prob")    # 8h model probability
+_both_agree = opp.get("both_agree")
 
 _hmm_regime = _hmm.get("regime_label", "STEADY_STATE")
 _hmm_conf   = _hmm.get("confidence", 0)
@@ -279,7 +282,10 @@ _stale_html    = (
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">{_time_pill}</span>'
 )
 _levels_html = ""
+_sup_price = _ns.get("price", 0)
+_res_price = _nr.get("price", 0)
 if _brief_label in ("LONG", "SHORT") and _stop and _target:
+    # Active trade: show entry/stop/target
     _levels_html = (
         f'<div style="margin-top:12px;display:flex;gap:24px;font-size:0.88rem">'
         f'<span style="color:#aaa">Entry <b style="color:#fff">${_entry:.5f}</b></span>'
@@ -288,11 +294,111 @@ if _brief_label in ("LONG", "SHORT") and _stop and _target:
         f'<span style="color:#aaa">R/R <b style="color:#fff">{_setup_rr:.1f}x</b></span>'
         f'</div>'
     )
+elif _brief_label in ("WATCH — NOT YET",) and (_sup_price or _res_price):
+    # WATCH: pre-plan levels so trader can prepare orders before signal fires
+    _w_stop   = _sup_price if direction == "LONG" else _res_price
+    _w_target = _res_price if direction == "LONG" else _sup_price
+    _w_sp = (_w_stop   - _entry) / (_entry + 1e-9) * 100 if _w_stop   else 0
+    _w_tp = (_w_target - _entry) / (_entry + 1e-9) * 100 if _w_target else 0
+    _w_rr = abs(_w_tp / (_w_sp + 1e-9)) if _w_sp else 0
+    if _w_stop or _w_target:
+        _levels_html = (
+            f'<div style="margin-top:12px;display:flex;gap:24px;font-size:0.85rem;'
+            f'border:1px dashed #444;border-radius:6px;padding:8px 12px;background:#1a1a1a">'
+            f'<span style="color:#777">Pre-plan if signal fires:</span>'
+            f'<span style="color:#888">Stop <b style="color:#b0756a">${_w_stop:.5f} ({_w_sp:+.1f}%)</b></span>'
+            f'<span style="color:#888">Target <b style="color:#7da87d">${_w_target:.5f} ({_w_tp:+.1f}%)</b></span>'
+            f'<span style="color:#888">R/R <b style="color:#aaa">{_w_rr:.1f}x</b></span>'
+            f'</div>'
+        )
+elif _sup_price or _res_price:
+    # PASS/BLOCKED: show key levels for situational awareness
+    _levels_html = (
+        f'<div style="margin-top:10px;display:flex;gap:24px;font-size:0.83rem;color:#555">'
+        f'<span>Key levels:</span>'
+        + (f'<span>Support <b style="color:#6a6a6a">${_sup_price:.5f}</b></span>' if _sup_price else '')
+        + (f'<span>Resistance <b style="color:#6a6a6a">${_res_price:.5f}</b></span>' if _res_price else '')
+        + f'</div>'
+    )
+
+# ── Model Agreement row (dual-horizon visibility) ────────────────────────────
+# Show individual 4h and 8h probabilities so traders can see whether this is
+# a strong consensus or a minimum-threshold agreement.
+def _prob_bar_html(prob, label, gated=False):
+    """Render a mini probability bar with label and checkmark."""
+    if gated or prob is None:
+        return (
+            f'<div style="flex:1;text-align:center">'
+            f'<div style="color:#555;font-size:0.78rem;margin-bottom:4px">{label}</div>'
+            f'<div style="background:#1e1e1e;border-radius:4px;height:8px;width:100%;margin-bottom:4px">'
+            f'<div style="background:#333;height:8px;border-radius:4px;width:100%"></div></div>'
+            f'<div style="color:#555;font-size:0.9rem">— gated</div>'
+            f'</div>'
+        )
+    pct    = int(prob * 100)
+    agree  = prob >= 0.50
+    bar_c  = "#4caf50" if agree else "#ef5350"
+    txt_c  = "#a5d6a7" if agree else "#ef9a9a"
+    check  = "✓" if agree else "✗"
+    width  = f"{pct}%"
+    return (
+        f'<div style="flex:1;text-align:center">'
+        f'<div style="color:#aaa;font-size:0.78rem;margin-bottom:4px">{label}</div>'
+        f'<div style="background:#1e1e1e;border-radius:4px;height:8px;width:100%;margin-bottom:4px">'
+        f'<div style="background:{bar_c};height:8px;border-radius:4px;width:{width};transition:width 0.3s"></div></div>'
+        f'<div style="color:{txt_c};font-size:0.9rem;font-weight:700">{pct}% {check}</div>'
+        f'</div>'
+    )
+
+_gated = _tier in ("BLOCKED", "BLOCKED (SESSION)")
+if _p4_prob is not None and _p8_prob is not None:
+    # Agreement badge text and color
+    if _gated:
+        _agree_badge  = "GATED"
+        _agree_color  = "#546e7a"
+        _agree_bg     = "#1a2226"
+    elif _both_agree:
+        _min_p = min(_p4_prob, _p8_prob)
+        if _min_p >= 0.65:
+            _agree_badge  = "STRONG CONSENSUS ✓✓"
+            _agree_color  = "#4caf50"
+            _agree_bg     = "#0a1f0a"
+        else:
+            _agree_badge  = "BOTH AGREE ✓✓"
+            _agree_color  = "#81c784"
+            _agree_bg     = "#0a1a0a"
+    elif _p4_prob >= 0.50:
+        _agree_badge  = "8h SKEPTICAL ✗"
+        _agree_color  = "#e65100"
+        _agree_bg     = "#1a0e00"
+    elif _p8_prob >= 0.50:
+        _agree_badge  = "4h NOT READY ✗"
+        _agree_color  = "#fbc02d"
+        _agree_bg     = "#1a1500"
+    else:
+        _agree_badge  = "BOTH SKEPTICAL ✗✗"
+        _agree_color  = "#ef5350"
+        _agree_bg     = "#1a0000"
+
+    _agree_html = (
+        f'<div style="margin-top:12px;background:{_agree_bg};border-radius:8px;padding:10px 14px">'
+        f'<div style="display:flex;align-items:center;gap:16px">'
+        + _prob_bar_html(_p4_prob, "4h Model", _gated)
+        + f'<div style="text-align:center;min-width:130px">'
+          f'<div style="color:{_agree_color};font-size:0.82rem;font-weight:700;letter-spacing:0.3px">{_agree_badge}</div>'
+          f'<div style="color:#888;font-size:0.75rem;margin-top:2px">Score {_score}/100</div>'
+          f'</div>'
+        + _prob_bar_html(_p8_prob, "8h Model", _gated)
+        + f'</div>'
+          f'</div>'
+    )
+else:
+    _agree_html = ""
 
 _brief_html = (
     f'<div style="background:{_brief_bg};border:2px solid {_brief_color};border-radius:12px;padding:18px 24px;margin-bottom:14px">'
     f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
-    f'<div>'
+    f'<div style="flex:1">'
     f'<div style="font-size:2rem;font-weight:900;color:{_brief_color};letter-spacing:0.5px">{_brief_icon} {_brief_label}{_weekend_note}</div>'
     f'<div style="color:#ccc;font-size:0.95rem;margin-top:4px">{_brief_reason}</div>'
     f'{_levels_html}'
@@ -303,7 +409,8 @@ _brief_html = (
     f'<div style="color:#aaa;font-size:0.8rem">Kelly {_kelly_f:.0%} · p={_meta_prob:.0%}</div>'
     f'</div>'
     f'</div>'
-    f'<div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px;font-size:0.78rem">'
+    f'{_agree_html}'
+    f'<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;font-size:0.78rem">'
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">HMM: <b style="color:{_hmm_pill_col}">{_hmm_regime} {_hmm_conf:.0%}</b></span>'
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">Session: <b style="color:#fff">{session}</b></span>'
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">FART: <b style="color:#64b5f6">${fart_price:.5f}</b></span>'
@@ -338,6 +445,35 @@ if action.get("weekend_note"):  _notes.append(("🏖️", action["weekend_note"]
 for _ic, _nt, _kd in _notes:
     getattr(st, _kd)(f"{_ic} {_nt}")
 
+# ── Live Hit Rate Widget (trust calibration from trade journal) ───────────────
+try:
+    _jpath = DATA_DIR / "trade_journal.csv"
+    if _jpath.exists():
+        _jdf = pd.read_csv(_jpath)
+        _jdf_tier = _jdf[(_jdf.get("tier", pd.Series(dtype=str)) == _tier) & (_jdf["hit"].astype(str).str.strip() != "")]
+        if len(_jdf_tier) >= 5:
+            _n   = min(len(_jdf_tier), 20)
+            _rec = _jdf_tier.tail(_n)
+            _hits = int((_rec["hit"].astype(float) == 1).sum())
+            _hr   = _hits / _n
+            _hr_c = "#4caf50" if _hr >= 0.65 else "#f9a825" if _hr >= 0.50 else "#ef5350"
+            st.markdown(
+                f'<div style="font-size:0.82rem;color:#666;margin-bottom:8px;padding:6px 0">'
+                f'📊 Recent performance at this tier:  '
+                f'<b style="color:#888">Last {_n} · {_tier}</b>  →  '
+                f'<b style="color:{_hr_c}">{_hr:.0%} hit</b>  '
+                f'<span style="color:#555">({_hits}/{_n} wins)</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        elif len(_jdf_tier) >= 1:
+            st.markdown(
+                f'<div style="font-size:0.82rem;color:#444;margin-bottom:8px">📊 Building history for {_tier} tier ({len(_jdf_tier)} samples so far)</div>',
+                unsafe_allow_html=True,
+            )
+except Exception:
+    pass
+
 st.markdown("---")
 
 
@@ -345,14 +481,18 @@ st.markdown("---")
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab_signal, tab_proj, tab_timing, tab_exchange, tab_btc, tab_rules = st.tabs([
-    "📊 Signal",
-    "🔮 Projections",
-    "⏰ Timing",
-    "🏦 Exchange",
-    "₿ BTC",
-    "📋 Rules",
+tab_edge, tab_timing, tab_context, tab_rules = st.tabs([
+    "⚡ Edge",       # Signal + Projections merged — the primary decision tab
+    "⏰ Timing",     # Session windows, kill zones, timing playbook
+    "🌐 Context",    # Exchange flow + BTC regime (market structure, less frequent)
+    "📋 Reference",  # Static playbook, rules, reference tables
 ])
+
+# Aliases so existing tab_signal / tab_proj / tab_exchange / tab_btc code still works
+tab_signal   = tab_edge
+tab_proj     = tab_edge
+tab_exchange = tab_context
+tab_btc      = tab_context
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -615,6 +755,89 @@ with tab_signal:
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab_proj:
+
+    # ── Model Confidence (dual-horizon) ──────────────────────────────────────
+    # The primary new signal from the dual-horizon model: show both the 4h and 8h
+    # model probabilities explicitly so traders understand the quality of agreement.
+    if _p4_prob is not None and _p8_prob is not None:
+        st.markdown("#### 🧠 Model Confidence")
+
+        _mc_p4_pct  = int(_p4_prob * 100)
+        _mc_p8_pct  = int(_p8_prob * 100)
+        _mc_gated   = _tier in ("BLOCKED", "BLOCKED (SESSION)")
+
+        # Interpretation copy
+        if _mc_gated:
+            _mc_interp = "Regime or session gate active — model output suppressed. Wait for the gate to lift."
+            _mc_interp_c = "#546e7a"
+        elif _both_agree and min(_p4_prob, _p8_prob) >= 0.65:
+            _mc_interp = "Strong consensus — both the short and medium-term models see a sustained move. High-quality setup."
+            _mc_interp_c = "#4caf50"
+        elif _both_agree:
+            _mc_interp = "Agreement at minimum threshold — valid signal but treat position size conservatively."
+            _mc_interp_c = "#81c784"
+        elif _p4_prob >= 0.50 and _p8_prob < 0.50:
+            _mc_interp = "4h model bullish but 8h model skeptical — pump-and-dump risk. Not trading until 8h model agrees."
+            _mc_interp_c = "#e65100"
+        elif _p4_prob < 0.50 and _p8_prob >= 0.50:
+            _mc_interp = "Slow buildup detected — 8h model sees the move but 4h entry timing isn't right yet. Watch for confirming bar."
+            _mc_interp_c = "#fbc02d"
+        else:
+            _mc_interp = "Both models below threshold — no edge in either timeframe."
+            _mc_interp_c = "#ef5350"
+
+        _mc4_c = "#4caf50" if _p4_prob >= 0.50 and not _mc_gated else ("#ef5350" if not _mc_gated else "#333")
+        _mc8_c = "#4caf50" if _p8_prob >= 0.50 and not _mc_gated else ("#ef5350" if not _mc_gated else "#333")
+        _mc4_check = ("✓" if _p4_prob >= 0.50 else "✗") if not _mc_gated else "—"
+        _mc8_check = ("✓" if _p8_prob >= 0.50 else "✗") if not _mc_gated else "—"
+        _mc4_w = f"{_mc_p4_pct}%" if not _mc_gated else "50%"
+        _mc8_w = f"{_mc_p8_pct}%" if not _mc_gated else "50%"
+
+        _mc_col1, _mc_col2, _mc_col3 = st.columns([2, 1, 2])
+        with _mc_col1:
+            st.markdown(
+                f'<div style="background:#0d1521;border:1px solid {_mc4_c};border-radius:10px;padding:16px 20px;text-align:center">'
+                f'<div style="color:#aaa;font-size:0.8rem;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px">4-Hour Model</div>'
+                f'<div style="font-size:2.2rem;font-weight:900;color:{_mc4_c}">{_mc4_check} {_mc_p4_pct}%</div>'
+                f'<div style="background:#1e1e1e;border-radius:4px;height:8px;margin:10px 0">'
+                f'<div style="background:{_mc4_c};height:8px;border-radius:4px;width:{_mc4_w};opacity:0.8"></div></div>'
+                f'<div style="color:#666;font-size:0.78rem">short-term edge</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with _mc_col2:
+            st.markdown(
+                f'<div style="text-align:center;padding:16px 0">'
+                f'<div style="color:{_mc_interp_c};font-size:0.85rem;font-weight:700;letter-spacing:0.3px;margin-bottom:8px">'
+                + ("STRONG<br>CONSENSUS ✓✓" if _both_agree and min(_p4_prob, _p8_prob) >= 0.65
+                   else "BOTH AGREE ✓✓" if _both_agree
+                   else "8h SKEPTICAL" if _p4_prob >= 0.50
+                   else "4h NOT READY" if _p8_prob >= 0.50
+                   else "BOTH SKEPTICAL" if not _mc_gated
+                   else "GATED") +
+                f'</div>'
+                f'<div style="color:#555;font-size:0.75rem">avg: {_meta_prob:.0%}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with _mc_col3:
+            st.markdown(
+                f'<div style="background:#0d1521;border:1px solid {_mc8_c};border-radius:10px;padding:16px 20px;text-align:center">'
+                f'<div style="color:#aaa;font-size:0.8rem;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px">8-Hour Model</div>'
+                f'<div style="font-size:2.2rem;font-weight:900;color:{_mc8_c}">{_mc8_check} {_mc_p8_pct}%</div>'
+                f'<div style="background:#1e1e1e;border-radius:4px;height:8px;margin:10px 0">'
+                f'<div style="background:{_mc8_c};height:8px;border-radius:4px;width:{_mc8_w};opacity:0.8"></div></div>'
+                f'<div style="color:#666;font-size:0.78rem">medium-term sustained</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            f'<div style="background:#0d1521;border-left:3px solid {_mc_interp_c};border-radius:0 6px 6px 0;'
+            f'padding:8px 14px;margin-top:6px;margin-bottom:16px;font-size:0.88rem;color:{_mc_interp_c};">'
+            f'{_mc_interp}</div>',
+            unsafe_allow_html=True,
+        )
+        st.divider()
 
     # ── Row 0: Exit plan reminder ─────────────────────────────────────────────
     st.markdown(

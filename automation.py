@@ -41,7 +41,23 @@ def run_pipeline(mode="light", coin=DEFAULT_COIN):
     perp_sym = cfg["perp_symbol"]
     cg_id    = cfg["cg_coin_id"]
 
-    # Step 1: Collect data
+    # Step 1a: Refresh Bybit tick-derived OHLCV + taker BSR (yesterday's file)
+    #          ingest_yesterday() also calls refresh_oi_lsr() internally
+    try:
+        from ingest_bybit import ingest_yesterday, refresh_oi_lsr
+        ingest_yesterday()
+        print("Bybit daily ingest + OI/LSR refresh: OK", file=sys.stderr)
+    except Exception as _e:
+        print(f"Bybit daily ingest: SKIP ({_e})", file=sys.stderr)
+        # Attempt standalone OI/LSR refresh even if tick download failed
+        try:
+            from ingest_bybit import refresh_oi_lsr
+            refresh_oi_lsr(hours=48)
+            print("Bybit OI/LSR refresh (standalone): OK", file=sys.stderr)
+        except Exception as _e2:
+            print(f"Bybit OI/LSR refresh: SKIP ({_e2})", file=sys.stderr)
+
+    # Step 1b: Collect live derivatives data
     if mode == "full":
         print("Collecting all data...", file=sys.stderr)
         collect_all(cmc_symbol=cmc_sym, perp_symbol=perp_sym, cg_coin_id=cg_id)

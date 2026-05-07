@@ -136,15 +136,23 @@ def load_all_data(cmc_sym, perp_sym):
 
 data = load_all_data(_cmc_sym, _perp_sym)
 
-# Computed state
-mkt    = compute_market_state(data)
-action = determine_action(mkt)
-proj   = compute_projections(data, mkt)
 
-# Active alerts (both signal-level and projection-level)
-_sig_alerts  = evaluate_alerts(mkt, action)
-_proj_alerts = evaluate_projection_alerts(proj, mkt)
-all_alerts   = _sig_alerts + _proj_alerts
+@st.cache_data(ttl=300)
+def compute_state(cmc_sym, _cache_key):
+    """Cache the heavy computation (HMM fit + LGBM training) for 5 minutes.
+    _cache_key is the last OHLCV timestamp string — forces refresh when new data arrives."""
+    _data = load_all_data(cmc_sym, _perp_sym)
+    _mkt    = compute_market_state(_data)
+    _action = determine_action(_mkt)
+    _proj   = compute_projections(_data, _mkt)
+    _sig_alerts  = evaluate_alerts(_mkt, _action)
+    _proj_alerts = evaluate_projection_alerts(_proj, _mkt)
+    return _mkt, _action, _proj, _sig_alerts + _proj_alerts
+
+
+# Cache key = last OHLCV row timestamp (changes only when new candle data arrives)
+_ohlcv_key = str(data["ohlcv"].index[-1]) if "ohlcv" in data and not data["ohlcv"].empty else "none"
+mkt, action, proj, all_alerts = compute_state(_cmc_sym, _ohlcv_key)
 
 # Data freshness — use the most recently modified source data file
 # (signals file reflects automation run time, not data recency)

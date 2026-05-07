@@ -146,12 +146,20 @@ _sig_alerts  = evaluate_alerts(mkt, action)
 _proj_alerts = evaluate_projection_alerts(proj, mkt)
 all_alerts   = _sig_alerts + _proj_alerts
 
-# Data freshness
-_signals_file = DATA_DIR / f"signals_{_cmc_sym}.csv"
+# Data freshness — use the most recently modified source data file
+# (signals file reflects automation run time, not data recency)
+_freshness_candidates = [
+    DATA_DIR / f"FARTCOIN_ohlcv_hourly.csv",
+    DATA_DIR / f"FARTCOINUSDT_oi.csv",
+    DATA_DIR / f"FARTCOINUSDT_lsr.csv",
+    DATA_DIR / f"FARTCOINUSDT_funding.csv",
+]
 _data_age_min = None
-if _signals_file.exists():
-    _mtime = datetime.fromtimestamp(os.path.getmtime(_signals_file), tz=timezone.utc)
-    _data_age_min = (utc_now - _mtime).total_seconds() / 60
+for _f in _freshness_candidates:
+    if _f.exists():
+        _age = (utc_now - datetime.fromtimestamp(os.path.getmtime(_f), tz=timezone.utc)).total_seconds() / 60
+        if _data_age_min is None or _age < _data_age_min:
+            _data_age_min = _age
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,8 +272,13 @@ _setup_rr   = abs(_target_pct / (_stop_pct + 1e-9)) if _stop_pct else 0
 # ── Freshness badge ───────────────────────────────────────────────────────────
 _fresh_str = ""
 if _data_age_min is not None:
-    _fresh_str = (f"Data {_data_age_min:.0f}m ago" if _data_age_min < 35
-                  else f"⚠ Data {_data_age_min:.0f}m old — refresh needed")
+    _age_h = _data_age_min / 60
+    if _data_age_min < 120:
+        _fresh_str = f"Data {_data_age_min:.0f}m ago"
+    elif _data_age_min < 240:
+        _fresh_str = f"Data {_age_h:.1f}h ago"
+    else:
+        _fresh_str = f"⚠ Data {_age_h:.1f}h old — refresh needed"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRADE DESK BRIEF — the single card the desk reads first
@@ -278,7 +291,7 @@ _risk_pill_col = "#ef9a9a" if risk_score >= 4 else "#f9a825" if risk_score >= 2 
 _time_pill     = utc_now.strftime("%H:%M UTC") + (f" · {_fresh_str}" if _fresh_str else "")
 _stale_html    = (
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#ff8f00">⚠ {_fresh_str}</span>'
-    if _data_age_min and _data_age_min >= 35 else
+    if _data_age_min and _data_age_min >= 240 else
     f'<span style="background:#263238;padding:3px 10px;border-radius:20px;color:#b0bec5">{_time_pill}</span>'
 )
 _levels_html = ""

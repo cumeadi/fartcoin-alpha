@@ -30,6 +30,12 @@ try:
 except ImportError:
     HAS_EXTERNAL = False
 
+try:
+    from notifiers import notify_telegram as _notify_telegram
+    HAS_NOTIFIER = True
+except ImportError:
+    HAS_NOTIFIER = False
+
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -164,8 +170,9 @@ def _log_trade_journal(output, data_dir):
         "avg_funding":    ms.get("avg_funding", 0),
         "session":        ms.get("session", ""),
         "alerts_n":       len(output.get("alerts", [])),
-        "outcome_4h":     "",   # filled in by next run
-        "hit":            "",   # filled in by next run
+        "outcome_4h":     "",   # filled in by next run (direction-adjusted %)
+        "realized_pct":   "",   # alias for outcome_4h (for equity curve)
+        "hit":            "",   # filled in by next run (1 if raw 4h move > 0.45%)
     }
 
     # ── Resolve previous row's outcome ───────────────────────────────────────
@@ -175,11 +182,17 @@ def _log_trade_journal(output, data_dir):
             if len(prev_df) > 0 and "fart_price" in prev_df.columns:
                 last_row = prev_df.iloc[-1]
                 if str(last_row.get("outcome_4h", "")).strip() == "" and float(last_row.get("fart_price", 0)) > 0:
-                    last_price = float(last_row["fart_price"])
-                    outcome    = (price - last_price) / last_price
-                    hit        = 1 if outcome > 0.0045 else 0
-                    prev_df.iloc[-1, prev_df.columns.get_loc("outcome_4h")] = round(outcome * 100, 4)
-                    prev_df.iloc[-1, prev_df.columns.get_loc("hit")]        = hit
+                    last_price  = float(last_row["fart_price"])
+                    raw_outcome = (price - last_price) / last_price
+                    # Direction-adjust so the equity curve reflects actual P&L
+                    _prev_dir   = str(last_row.get("direction", "LONG")).upper()
+                    outcome     = -raw_outcome if _prev_dir == "SHORT" else raw_outcome
+                    hit         = 1 if raw_outcome > 0.0045 else 0
+                    prev_df.iloc[-1, prev_df.columns.get_loc("outcome_4h")]   = round(outcome * 100, 4)
+                    prev_df.iloc[-1, prev_df.columns.get_loc("hit")]          = hit
+                    # Write realized_pct if column exists
+                    if "realized_pct" in prev_df.columns:
+                        prev_df.iloc[-1, prev_df.columns.get_loc("realized_pct")] = round(outcome * 100, 4)
                     prev_df.to_csv(journal_path, index=False)
                     print(f"  [journal] Resolved last entry: outcome={outcome:+.3%}, hit={hit}", file=sys.stderr)
         except Exception as _e:
@@ -229,6 +242,13 @@ def main():
     # Log to trade journal (non-snapshot runs only — snapshot has no fresh price)
     if args.mode != "snapshot":
         _log_trade_journal(output, DATA_DIR)
+
+    # Push Telegram alert if tier upgraded
+    if HAS_NOTIFIER and args.mode != "snapshot":
+        try:
+            _notify_telegram(output)
+        except Exception as _ne:
+            print(f"Telegram notify: SKIP ({_ne})", file=sys.stderr)
 
     # Print JSON to stdout (for scheduled task to parse)
     print(json.dumps(output, indent=2, default=str))

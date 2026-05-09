@@ -495,6 +495,63 @@ try:
 except Exception:
     pass
 
+# ── Equity Curve ──────────────────────────────────────────────────────────────
+try:
+    _jpath = DATA_DIR / "trade_journal.csv"
+    if _jpath.exists():
+        _eq_df = pd.read_csv(_jpath)
+        _eq_resolved = _eq_df[_eq_df["outcome_4h"].astype(str).str.strip() != ""].copy()
+        if len(_eq_resolved) >= 5:
+            _eq_resolved["outcome_4h"] = pd.to_numeric(_eq_resolved["outcome_4h"], errors="coerce")
+            _eq_resolved["timestamp"]  = pd.to_datetime(_eq_resolved["timestamp"], utc=True, errors="coerce")
+            _eq_resolved = _eq_resolved.dropna(subset=["outcome_4h", "timestamp"]).sort_values("timestamp")
+
+            _trade_tiers = [t for t in _eq_resolved["tier"].dropna().unique()
+                            if t not in ("PASS", "WATCH", "BLOCKED", "BLOCKED (SESSION)")]
+
+            import plotly.graph_objects as go
+            _fig_eq = go.Figure()
+            # All-entries baseline
+            _fig_eq.add_trace(go.Scatter(
+                x=_eq_resolved["timestamp"], y=_eq_resolved["outcome_4h"].cumsum(),
+                name="All entries", line=dict(color="#546e7a", width=1, dash="dot"),
+            ))
+            _tier_colors = {"TRADE": "#f9a825", "HIGH CONVICTION": "#29b6f6", "FULL SEND": "#66bb6a"}
+            for _t in _trade_tiers:
+                _sub = _eq_resolved[_eq_resolved["tier"] == _t].copy()
+                if len(_sub) < 2:
+                    continue
+                _sub_indexed = _sub.set_index("timestamp").reindex(_eq_resolved["timestamp"]).fillna(0)
+                _fig_eq.add_trace(go.Scatter(
+                    x=_sub_indexed.index, y=_sub_indexed["outcome_4h"].cumsum(),
+                    name=_t, line=dict(color=_tier_colors.get(_t, "#aaaaaa"), width=2),
+                ))
+            _fig_eq.update_layout(
+                title="Cumulative P&L by Tier (%)",
+                height=240, margin=dict(l=40, r=20, t=30, b=30),
+                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                font=dict(color="#ccc", size=11),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                xaxis=dict(gridcolor="#1e2a30"), yaxis=dict(gridcolor="#1e2a30", ticksuffix="%"),
+            )
+            st.plotly_chart(_fig_eq, use_container_width=True, key="equity_curve")
+
+            # Rolling stats below chart
+            _all_trade = _eq_resolved[_eq_resolved["tier"].isin(_trade_tiers)] if _trade_tiers else _eq_resolved
+            if len(_all_trade) >= 5:
+                _n_roll  = min(20, len(_all_trade))
+                _roll_wr = (_all_trade["outcome_4h"].tail(_n_roll) > 0).mean()
+                _wins    = _all_trade["outcome_4h"][_all_trade["outcome_4h"] > 0]
+                _losses  = _all_trade["outcome_4h"][_all_trade["outcome_4h"] <= 0]
+                _avg_w   = float(_wins.mean())         if len(_wins) > 0   else 0.0
+                _avg_l   = float(abs(_losses.mean()))  if len(_losses) > 0 else 0.001
+                _c1, _c2, _c3 = st.columns(3)
+                _c1.metric(f"Rolling WR (last {_n_roll})", f"{_roll_wr:.0%}")
+                _c2.metric("Avg Win",    f"+{_avg_w:.2f}%")
+                _c3.metric("W/L Ratio",  f"{_avg_w/_avg_l:.2f}x")
+except Exception:
+    pass
+
 st.markdown("---")
 
 

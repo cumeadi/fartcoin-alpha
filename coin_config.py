@@ -35,6 +35,52 @@ COIN_CONFIG = {
         "display_name":      "Zcash",
         "emoji":             "🛡",
     },
+    "SOL": {
+        "cmc_symbol":        "SOL",
+        "perp_symbol":       "SOLUSDT",
+        "cg_coin_id":        "solana",
+        "cp_coin_id":        "solana",
+        "coinglass_ticker":  "SOL",
+        "coinalyze_symbols": [
+            "SOLUSDT_PERP.A",  # Binance
+            "SOLUSDT.6",       # Bybit
+            "SOLUSDT_PERP.3",  # OKX
+            "SOLUSDT_PERP.4",  # Bitget
+        ],
+        "blockchain":        "solana",
+        "display_name":      "Solana",
+        "emoji":             "◎",
+    },
+    "WIF": {
+        "cmc_symbol":        "WIF",
+        "perp_symbol":       "WIFUSDT",
+        "cg_coin_id":        "dogwifcoin",
+        "cp_coin_id":        "dogwifhat-wif",
+        "coinglass_ticker":  "WIF",
+        "coinalyze_symbols": [
+            "WIFUSDT_PERP.A",  # Binance
+            "WIFUSDT.6",       # Bybit
+            "WIFUSDT_PERP.3",  # OKX
+        ],
+        "blockchain":        "solana",
+        "display_name":      "dogwifhat",
+        "emoji":             "🐕",
+    },
+    "BONK": {
+        "cmc_symbol":        "BONK",
+        "perp_symbol":       "BONKUSDT",
+        "cg_coin_id":        "bonk",
+        "cp_coin_id":        "bonk-bonk",
+        "coinglass_ticker":  "BONK",
+        "coinalyze_symbols": [
+            "BONKUSDT_PERP.A",  # Binance
+            "BONKUSDT.6",       # Bybit
+            "BONKUSDT_PERP.3",  # OKX
+        ],
+        "blockchain":        "solana",
+        "display_name":      "Bonk",
+        "emoji":             "🔨",
+    },
 }
 
 DEFAULT_COIN = "FARTCOIN"

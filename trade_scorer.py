@@ -57,14 +57,25 @@ except ImportError:
     _LSTM_OK = False
     LOOKBACK  = 10
 
+try:
+    import joblib
+    _JOBLIB_OK = True
+except ImportError:
+    _JOBLIB_OK = False
+
+import hashlib
+
 from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_matrix as _hmm_features, label_current as _hmm_label_current
 from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
 
-CARRY_COST  = 0.0045   # 0.45% / 4h — Bybit floor
-TRAIN_WIN   = 500      # rolling training window (widened: more history = more stable estimates)
-STEP        = 6        # walk-forward step size
-MIN_TRAIN   = 250      # minimum rows before first prediction
+CARRY_COST      = 0.0045   # 0.45% / 4h — Bybit floor
+TRAIN_WIN       = 500      # rolling training window (widened: more history = more stable estimates)
+STEP            = 6        # walk-forward step size
+MIN_TRAIN       = 250      # minimum rows before first prediction
+LSTM_THRESHOLD  = 0.50     # prob gate for LSTM walk-forward + live scorer
+                            # Set to 0.50 to match LGBM dual-horizon gate;
+                            # raise to 0.55 if trade count > 200 and hit rate < 70%
 # Note on autocorrelation: btc_corr_7d uses 168h lookback, so consecutive test rows
 # are not independent. This inflates hit rate confidence — CI is ±~37% not ±28%.
 # A purge gap (tested at 24h) degraded performance badly because short-lag features
@@ -73,6 +84,8 @@ MIN_TRAIN   = 250      # minimum rows before first prediction
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+MODEL_DIR = Path(__file__).parent / "data" / "models"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -674,6 +687,42 @@ def walk_forward_meta(df):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Model persistence helpers — cache trained bundle to avoid 36s retraining
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _model_cache_key(train_df):
+    """MD5 of last timestamp + row count. Changes when new data arrives → retrain."""
+    raw = f"{train_df.index[-1]}_{len(train_df)}".encode()
+    return hashlib.md5(raw).hexdigest()[:12]
+
+
+def _save_model_bundle(key, bundle):
+    """Persist (m4, m8, ir, features) to data/models/<key>.pkl. Removes stale files."""
+    if not _JOBLIB_OK:
+        return
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        for old in MODEL_DIR.glob("*.pkl"):
+            old.unlink(missing_ok=True)
+        joblib.dump(bundle, MODEL_DIR / f"{key}.pkl", compress=3)
+    except Exception:
+        pass
+
+
+def _load_model_bundle(key):
+    """Load bundle if key file exists, else return None."""
+    if not _JOBLIB_OK:
+        return None
+    path = MODEL_DIR / f"{key}.pkl"
+    if path.exists():
+        try:
+            return joblib.load(path)
+        except Exception:
+            return None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Live scorer (uses last trained model implicitly via full-history features)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -729,37 +778,55 @@ def score_live(df, projections=None, live_hmm_label=None):
         return {"score": 50, "tier": "WATCH", "available": False}
 
     try:
-        # ── Dual-horizon ensemble: 4h model + 8h model ───────────────────────
-        # 80/20 in-sample split: fit on 80%, calibrate 4h model on 20%
-        split   = int(len(X_train) * 0.80)
-        X_fit   = X_train[:split]
-        y4_fit  = y4_train[:split]
-        X_cal   = X_train[split:]
-        y4_cal  = y4_train[split:]
+        # ── Training (with disk cache) ────────────────────────────────────────
+        # Cache keyed by last training row timestamp + count.
+        # Auto-invalidates when new candle data arrives; saves ~34s on cache hit.
+        cache_key = _model_cache_key(train)
+        bundle    = _load_model_bundle(cache_key)
 
-        m4 = lgb.LGBMClassifier(**_LGBM_PARAMS)
-        m4.fit(X_fit, y4_fit)
-        m8 = lgb.LGBMClassifier(**_LGBM_PARAMS)
-        m8.fit(X_train, y8_train)   # 8h model uses full window (no calibration needed)
+        if bundle is not None:
+            m4, m8, ir, available_features = bundle
+        else:
+            # ── Dual-horizon ensemble: 4h model + 8h model ───────────────────
+            # 80/20 in-sample split: fit on 80%, calibrate 4h model on 20%
+            split   = int(len(X_train) * 0.80)
+            X_fit   = X_train[:split]
+            y4_fit  = y4_train[:split]
+            X_cal   = X_train[split:]
+            y4_cal  = y4_train[split:]
 
+            m4 = lgb.LGBMClassifier(**_LGBM_PARAMS)
+            m4.fit(X_fit, y4_fit)
+            m8 = lgb.LGBMClassifier(**_LGBM_PARAMS)
+            m8.fit(X_train, y8_train)   # 8h model uses full window (no calibration needed)
+
+            # ── Isotonic regression calibration on 4h model ──────────────────
+            # Corrects overconfidence at high-probability bins (was 25pp off at 0.8+)
+            ir = None
+            try:
+                from sklearn.isotonic import IsotonicRegression
+                if len(X_cal) >= 20 and y4_cal.sum() >= 3 and (1 - y4_cal).sum() >= 3:
+                    raw_cal = m4.predict_proba(X_cal)[:, 1]
+                    ir = IsotonicRegression(out_of_bounds="clip")
+                    ir.fit(raw_cal, y4_cal)
+            except Exception:
+                pass   # fall back to uncalibrated probability
+
+            _save_model_bundle(cache_key, (m4, m8, ir, available_features))
+
+        # ── Inference ────────────────────────────────────────────────────────
         X_now    = row[available_features].values.reshape(1, -1)
         p4_raw   = float(m4.predict_proba(X_now)[0, 1])
         p8_raw   = float(m8.predict_proba(X_now)[0, 1])
         prob_raw = (p4_raw + p8_raw) / 2.0
         model    = m4   # use 4h model for feature importance
 
-        # ── Isotonic regression calibration on 4h model ──────────────────────
-        # Corrects overconfidence at high-probability bins (was 25pp off at 0.8+)
         p4_cal = p4_raw
-        try:
-            from sklearn.isotonic import IsotonicRegression
-            if len(X_cal) >= 20 and y4_cal.sum() >= 3 and (1 - y4_cal).sum() >= 3:
-                raw_cal = m4.predict_proba(X_cal)[:, 1]
-                ir = IsotonicRegression(out_of_bounds="clip")
-                ir.fit(raw_cal, y4_cal)
+        if ir is not None:
+            try:
                 p4_cal = float(ir.predict([p4_raw])[0])
-        except Exception:
-            pass   # fall back to uncalibrated probability
+            except Exception:
+                pass
         prob = (p4_cal + p8_raw) / 2.0
 
         # ── Map probability → 0-100 score ────────────────────────────────────
@@ -927,7 +994,7 @@ def walk_forward_lstm(df):
             except Exception:
                 hour_of_row = 12
             is_bad_session = int(hour_of_row >= 20)
-            meta_trade = int(prob > 0.55 and not is_hakai and not is_bad_session)
+            meta_trade = int(prob > LSTM_THRESHOLD and not is_hakai and not is_bad_session)
 
             results.append({
                 "timestamp":  df.index[i],

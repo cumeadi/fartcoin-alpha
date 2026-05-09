@@ -1,0 +1,47 @@
+name: 4-Hour Light Poll
+
+on:
+  schedule:
+    # 02, 06, 10, 18, 22 UTC  (skips 14:00 which is covered by daily_refresh)
+    - cron: "0 2  * * *"
+    - cron: "0 6  * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 18 * * *"
+    - cron: "0 22 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  light-poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run light poll
+        env:
+          CMC_API_KEY:        ${{ secrets.CMC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        # || true so partial data is always committed
+        run: python3 automation.py --mode light || true
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && echo "No data changes" || git commit -m "chore: 4h light poll [skip ci]"
+          git push

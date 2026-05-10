@@ -206,15 +206,19 @@ opp        = proj.get("opportunity", {})
 _hmm       = proj.get("hmm_regime", {})
 _sr        = proj.get("support_resistance", {})
 
-_score      = opp.get("score", 0)
-_tier       = opp.get("tier", "WATCH")
-_size_pct   = opp.get("size_pct", 0)
-_kelly_f    = opp.get("kelly_fraction", 0)
-_meta_prob  = opp.get("meta_prob", 0.5)
-_top_drv    = opp.get("top_drivers", [])
-_p4_prob    = opp.get("p4_prob")    # 4h model probability (None if legacy/unavailable)
-_p8_prob    = opp.get("p8_prob")    # 8h model probability
-_both_agree = opp.get("both_agree")
+_score           = opp.get("score", 0)
+_tier            = opp.get("tier", "WATCH")
+_size_pct        = opp.get("size_pct", 0)
+_kelly_f         = opp.get("kelly_fraction", 0)
+_meta_prob       = opp.get("meta_prob", 0.5)
+_top_drv         = opp.get("top_drivers", [])
+_p4_prob         = opp.get("p4_prob")    # 4h model probability (None if legacy/unavailable)
+_p8_prob         = opp.get("p8_prob")    # 8h model probability
+_both_agree      = opp.get("both_agree")
+_lstm_prob       = opp.get("lstm_prob")           # LSTM-raw lb=64+HMM probability
+_lstm_trade      = opp.get("lstm_trade", 0)       # 1 if LSTM independently fires
+_triple_agree    = opp.get("triple_agreement", 0) # 1 when LGBM+LSTM both fire
+_triple_escalated= opp.get("triple_escalated", False)
 
 _hmm_regime = _hmm.get("regime_label", "STEADY_STATE")
 _hmm_conf   = _hmm.get("confidence", 0)
@@ -401,6 +405,34 @@ if _p4_prob is not None and _p8_prob is not None:
         _agree_color  = "#ef5350"
         _agree_bg     = "#1a0000"
 
+    # Triple-agreement banner
+    if _triple_agree and not _gated:
+        _triple_html = (
+            f'<div style="margin-top:8px;background:#0a1f0a;border:1px solid #4caf50;'
+            f'border-radius:6px;padding:7px 12px;display:flex;align-items:center;gap:10px">'
+            f'<span style="font-size:1.1rem">🟢</span>'
+            f'<div>'
+            f'<div style="color:#4caf50;font-weight:800;font-size:0.85rem;letter-spacing:0.5px">'
+            f'TRIPLE AGREEMENT — FULL SEND ESCALATED</div>'
+            f'<div style="color:#aaa;font-size:0.75rem">'
+            f'LGBM 4h ✓ · LGBM 8h ✓ · LSTM-raw lb=64 ✓ &nbsp;|&nbsp; '
+            f'LSTM p={_lstm_prob:.0%} &nbsp;|&nbsp; 97.7% backtest hit rate</div>'
+            f'</div>'
+            f'</div>'
+        )
+    elif _lstm_prob is not None and not _gated:
+        _lstm_color = "#4caf50" if _lstm_trade else "#ef5350"
+        _lstm_label = "LSTM ✓" if _lstm_trade else "LSTM ✗"
+        _triple_html = (
+            f'<div style="margin-top:8px;background:#1a2226;border-radius:6px;'
+            f'padding:6px 12px;display:flex;align-items:center;gap:8px">'
+            f'<span style="color:{_lstm_color};font-size:0.8rem;font-weight:700">{_lstm_label}</span>'
+            f'<span style="color:#666;font-size:0.75rem">LSTM-raw lb=64 · p={_lstm_prob:.0%}</span>'
+            f'</div>'
+        )
+    else:
+        _triple_html = ""
+
     _agree_html = (
         f'<div style="margin-top:12px;background:{_agree_bg};border-radius:8px;padding:10px 14px">'
         f'<div style="display:flex;align-items:center;gap:16px">'
@@ -411,6 +443,7 @@ if _p4_prob is not None and _p8_prob is not None:
           f'</div>'
         + _prob_bar_html(_p8_prob, "8h Model", _gated)
         + f'</div>'
+          f'{_triple_html}'
           f'</div>'
     )
 else:

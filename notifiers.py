@@ -126,6 +126,9 @@ def _build_message(output: dict, prev_tier: str) -> str:
     d_emoji = _DIR_EMOJI.get(direction, "")
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
+    triple  = opp.get("triple_agreement", 0)
+    lstm_p  = opp.get("lstm_prob")
+
     lines = [
         f"{t_emoji} <b>FARTCOIN SIGNAL — {tier}</b>",
         f"{d_emoji} Direction: <b>{direction}</b> ({conviction})",
@@ -135,6 +138,8 @@ def _build_message(output: dict, prev_tier: str) -> str:
         f"📐 Size: <b>{size_pct}%</b>  Kelly: {kelly:.1%}",
         f"",
         f"🎯 P(4h): {p4:.1%}  |  P(8h): {p8:.1%}",
+        (f"🟢 <b>TRIPLE AGREEMENT</b>  |  LSTM p={lstm_p:.0%}  (97.7% hist. hit rate)"
+         if triple and lstm_p is not None else ""),
     ]
 
     if support is not None and resist is not None:

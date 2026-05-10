@@ -31,10 +31,12 @@ except ImportError:
     _HMM_AVAILABLE = False
 
 try:
-    from trade_scorer import build_meta_features, score_live as _score_live_meta
+    from trade_scorer import (build_meta_features, score_live as _score_live_meta,
+                               score_live_lstm_raw as _score_live_lstm_raw)
     _SCORER_AVAILABLE = True
 except ImportError:
     _SCORER_AVAILABLE = False
+    _score_live_lstm_raw = None
 
 try:
     from support_resistance import compute_sr_levels as _compute_sr_levels
@@ -2635,6 +2637,27 @@ def compute_projections(data, market_state):
             # history windows — live full-history label is authoritative).
             _live_hmm_lbl = hmm_regime.get("regime_label") if hmm_regime.get("available") else None
             opportunity = _score_live_meta(meta_df, live_hmm_label=_live_hmm_lbl)
+
+            # ── Triple-ensemble escalation ────────────────────────────────────
+            # When LGBM fires AND LSTM-raw lb=64+HMM independently agrees,
+            # escalate to FULL SEND (97.7% hit rate in walk-forward backtest).
+            _lgbm_fires = opportunity.get("tier") in ("TRADE", "HIGH CONVICTION", "FULL SEND")
+            if _lgbm_fires and _score_live_lstm_raw is not None:
+                try:
+                    _lstm_result = _score_live_lstm_raw(data, lookback=64,
+                                                         live_hmm_label=_live_hmm_lbl)
+                    _lstm_fires  = _lstm_result.get("trade", 0) == 1
+                    opportunity["lstm_prob"]  = _lstm_result.get("prob", 0.0)
+                    opportunity["lstm_trade"] = int(_lstm_fires)
+                    opportunity["triple_agreement"] = int(_lgbm_fires and _lstm_fires)
+                    if _lgbm_fires and _lstm_fires:
+                        # Escalate tier to FULL SEND and boost score
+                        opportunity["tier"]  = "FULL SEND"
+                        opportunity["score"] = max(opportunity.get("score", 80), 95)
+                        opportunity["triple_escalated"] = True
+                except Exception as _le:
+                    opportunity["lstm_error"] = str(_le)
+
         except Exception as _e:
             opportunity["error"] = str(_e)
 

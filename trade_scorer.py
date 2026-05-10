@@ -69,11 +69,14 @@ from hmm_engine import roll_regime_series as _roll_regime_series, build_feature_
 from signal_engine import load_data, compute_all_signals
 from coin_config import get_config, DEFAULT_COIN
 
-CARRY_COST      = 0.0045   # 0.45% / 4h — Bybit floor
-TRAIN_WIN       = 500      # rolling training window (widened: more history = more stable estimates)
-STEP            = 6        # walk-forward step size
-MIN_TRAIN       = 250      # minimum rows before first prediction
-LSTM_THRESHOLD  = 0.50     # prob gate for LSTM walk-forward + live scorer
+CARRY_COST          = 0.0045   # 0.45% / 4h — Bybit floor
+TRAIN_WIN           = 500      # rolling training window (widened: more history = more stable estimates)
+STEP                = 6        # walk-forward step size
+MIN_TRAIN           = 250      # minimum rows before first prediction
+LSTM_THRESHOLD      = 0.50     # prob gate for LSTM walk-forward + live scorer
+LSTM_RAW_LOOKBACK   = 48       # default sequence length for raw-OHLCV LSTM (hours)
+LSTM_RAW_FEATURES   = ["ret_1h", "range_pct", "vol_z24", "bsr", "oi_ret_1h", "lsr_raw"]
+LSTM_RAW_FEATURES_HMM = LSTM_RAW_FEATURES + ["hmm_hakai", "hmm_accum", "hmm_steady"]
                             # Set to 0.50 to match LGBM dual-horizon gate;
                             # raise to 0.55 if trade count > 200 and hit rate < 70%
 # Note on autocorrelation: btc_corr_7d uses 168h lookback, so consecutive test rows
@@ -1141,6 +1144,388 @@ def score_live_lstm(df, projections=None, live_hmm_label=None):
         }
     except Exception as e:
         return {"score": 50, "tier": "WATCH", "available": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Raw-OHLCV LSTM — minimal-feature, long-sequence variant
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score_live_lstm_raw(data: dict, lookback: int = 64,
+                        live_hmm_label: str = None) -> dict:
+    """
+    Train LSTM-raw on the last TRAIN_WIN rows of raw OHLCV features, score
+    the current bar.  Drop-in complement to score_live() for the triple
+    ensemble gate.
+
+    Returns a dict with keys:
+      available  — bool (False if LSTM not importable or not enough data)
+      prob       — sigmoid output [0, 1]
+      trade      — 1 if prob > LSTM_THRESHOLD and not hakai and not bad session
+      tier       — "TRADE" | "NO TRADE" (simplified; full tiers from LGBM)
+    """
+    if not _LSTM_OK:
+        return {"available": False, "prob": 0.0, "trade": 0, "tier": "NO TRADE",
+                "error": "lstm_model not available"}
+
+    from sklearn.preprocessing import StandardScaler
+
+    try:
+        # Build HMM source from meta_df
+        hmm_src = None
+        try:
+            meta = build_meta_features(data)
+            hmm_cols = [c for c in ["hmm_hakai", "hmm_accum", "hmm_steady"]
+                        if c in meta.columns]
+            if hmm_cols:
+                hmm_src = meta[hmm_cols]
+        except Exception:
+            pass
+
+        raw_df    = build_raw_ohlcv_df(data, hmm_df=hmm_src)
+        feat_cols = [f for f in LSTM_RAW_FEATURES_HMM if f in raw_df.columns]
+        n_feat    = len(feat_cols)
+        n         = len(raw_df)
+
+        if n < MIN_TRAIN + lookback + 10:
+            return {"available": False, "prob": 0.0, "trade": 0, "tier": "NO TRADE"}
+
+        train = raw_df.iloc[-(TRAIN_WIN + 1): -1]
+        row   = raw_df.iloc[-1]
+
+        # Hakai gate — prefer live label if provided
+        is_hakai = False
+        if live_hmm_label is not None:
+            is_hakai = (live_hmm_label == "HAKAI")
+        else:
+            is_hakai = bool(row.get("hmm_hakai", 0) > 0.5)
+
+        try:
+            current_hour = pd.Timestamp(raw_df.index[-1]).hour
+        except Exception:
+            current_hour = 12
+        is_bad_session = (current_hour >= 20)
+
+        # Train
+        X_raw    = train[feat_cols].values.astype(np.float32)
+        scaler   = StandardScaler()
+        X_scaled = scaler.fit_transform(X_raw)
+
+        X_seq, y_seq = build_sequences(X_scaled, train["target_4h"].values, lookback)
+        if len(X_seq) < 30:
+            return {"available": False, "prob": 0.0, "trade": 0, "tier": "NO TRADE"}
+
+        model = train_lstm(X_seq, y_seq, input_size=n_feat,
+                           hidden_size=128, num_layers=2, dropout=0.3,
+                           epochs=150, patience=15)
+
+        # Score
+        test_raw    = raw_df.iloc[-lookback - 1: -1][feat_cols].values.astype(np.float32)
+        test_scaled = scaler.transform(test_raw)
+        prob        = predict_lstm(model, test_scaled)
+
+        fires = bool(prob > LSTM_THRESHOLD and not is_hakai and not is_bad_session)
+
+        return {
+            "available": True,
+            "prob":      round(prob, 4),
+            "trade":     int(fires),
+            "tier":      "TRADE" if fires else "NO TRADE",
+        }
+
+    except Exception as e:
+        return {"available": False, "prob": 0.0, "trade": 0, "tier": "NO TRADE",
+                "error": str(e)}
+
+
+def build_raw_ohlcv_df(data: dict, hmm_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Build a minimal, stationary feature DataFrame from raw OHLCV + microstructure.
+    Sources with full 12k-row coverage only (no BTC/funding gaps).
+
+    Base features (LSTM_RAW_FEATURES):
+      ret_1h, range_pct, vol_z24, bsr, oi_ret_1h, lsr_raw
+
+    Optional HMM features when hmm_df is provided (LSTM_RAW_FEATURES_HMM):
+      hmm_hakai, hmm_accum, hmm_steady  — regime probs (0–1)
+
+    Returns DataFrame with features + target_4h/8h + fwd_ret_4h/8h.
+    """
+    ohlcv = data.get("ohlcv")
+    if ohlcv is None or ohlcv.empty:
+        raise ValueError("build_raw_ohlcv_df: no OHLCV data in data dict")
+
+    close = ohlcv["close"]
+    df    = pd.DataFrame(index=ohlcv.index)
+
+    # ── Price / volatility (stationary) ───────────────────────────────────────
+    df["ret_1h"]    = close.pct_change() * 100
+    df["range_pct"] = (ohlcv["high"] - ohlcv["low"]) / close.clip(lower=1e-12) * 100
+
+    # Volume z-score (rolling 24h — removes trend + daily seasonality)
+    log_vol       = np.log1p(ohlcv["volume"])
+    roll_mean     = log_vol.rolling(24, min_periods=8).mean()
+    roll_std      = log_vol.rolling(24, min_periods=8).std().clip(lower=1e-6)
+    df["vol_z24"] = ((log_vol - roll_mean) / roll_std).clip(-4, 4)
+
+    # ── Taker BSR ─────────────────────────────────────────────────────────────
+    taker = data.get("taker")
+    if taker is not None and not taker.empty:
+        df["bsr"] = taker["buySellRatio"].reindex(df.index).ffill().fillna(0.5)
+    else:
+        df["bsr"] = 0.5
+
+    # ── OI returns ────────────────────────────────────────────────────────────
+    oi = data.get("oi")
+    if oi is not None and not oi.empty:
+        oi_al           = oi["sumOpenInterestValue"].reindex(df.index).ffill()
+        df["oi_ret_1h"] = oi_al.pct_change().clip(-0.5, 0.5).fillna(0.0) * 100
+    else:
+        df["oi_ret_1h"] = 0.0
+
+    # ── LSR → long-fraction (0–1) ─────────────────────────────────────────────
+    lsr = data.get("lsr")
+    if lsr is not None and not lsr.empty:
+        lsr_al        = lsr["longShortRatio"].reindex(df.index).ffill()
+        df["lsr_raw"] = (lsr_al / (1 + lsr_al)).fillna(0.5).clip(0, 1)
+    else:
+        df["lsr_raw"] = 0.5
+
+    # ── Optional HMM regime features ──────────────────────────────────────────
+    if hmm_df is not None and not hmm_df.empty:
+        for col in ["hmm_hakai", "hmm_accum", "hmm_steady"]:
+            if col in hmm_df.columns:
+                df[col] = hmm_df[col].reindex(df.index).ffill().fillna(0.0)
+
+    # ── Targets ───────────────────────────────────────────────────────────────
+    fwd_4h           = close.shift(-4) / close - 1
+    fwd_8h           = close.shift(-8) / close - 1
+    df["fwd_ret_4h"] = fwd_4h
+    df["fwd_ret_8h"] = fwd_8h
+    df["target_4h"]  = (fwd_4h > CARRY_COST).astype(int)
+    df["target_8h"]  = (fwd_8h > CARRY_COST * 2).astype(int)
+
+    df = df.dropna(subset=LSTM_RAW_FEATURES)
+    return df
+
+
+def walk_forward_lstm_raw(data: dict, lookback: int = LSTM_RAW_LOOKBACK,
+                          use_hmm: bool = False):
+    """
+    Walk-forward backtest using TradingLSTM on raw OHLCV features.
+
+    Parameters
+    ----------
+    lookback  : sequence length in hours (48 / 64 / 96)
+    use_hmm   : if True, adds hmm_hakai/hmm_accum/hmm_steady as extra input
+                features AND applies the hard hakai gate (same as LGBM)
+
+    Returns same DataFrame schema as walk_forward_meta().
+    """
+    if not _LSTM_OK:
+        raise RuntimeError("lstm_model.py / torch not available")
+
+    from sklearn.preprocessing import StandardScaler
+
+    # Build HMM source df when requested (HMM cols live in meta-df, not signals)
+    hmm_src = None
+    if use_hmm:
+        try:
+            meta = build_meta_features(data)
+            hmm_cols = [c for c in ["hmm_hakai", "hmm_accum", "hmm_steady"]
+                        if c in meta.columns]
+            if hmm_cols:
+                hmm_src = meta[hmm_cols]
+        except Exception:
+            pass
+
+    raw_df    = build_raw_ohlcv_df(data, hmm_df=hmm_src)
+    base_feats = LSTM_RAW_FEATURES_HMM if use_hmm else LSTM_RAW_FEATURES
+    feat_cols  = [f for f in base_feats if f in raw_df.columns]
+    n_feat     = len(feat_cols)
+    n          = len(raw_df)
+    start      = MIN_TRAIN + TRAIN_WIN
+    indices    = list(range(start, n - 8, STEP))
+    tag        = f"lstm-raw lb={lookback}" + ("+hmm" if use_hmm else "")
+
+    print(f"  [{tag}] Walk-forward: {len(indices)} eval points, "
+          f"{n_feat} features, lookback={lookback}h", flush=True)
+
+    results = []
+    for k, i in enumerate(indices):
+        if k % 20 == 0:
+            pct = k / len(indices) * 100
+            print(f"    [{pct:3.0f}%] {raw_df.index[i]}", flush=True)
+
+        train = raw_df.iloc[i - TRAIN_WIN: i]
+        row   = raw_df.iloc[i]
+
+        y_train_raw = train["target_4h"].values
+        if y_train_raw.sum() < 10 or (1 - y_train_raw).sum() < 10:
+            continue
+
+        try:
+            X_raw    = train[feat_cols].values.astype(np.float32)
+            scaler   = StandardScaler()
+            X_scaled = scaler.fit_transform(X_raw)
+
+            X_seq, y_seq = build_sequences(X_scaled, y_train_raw, lookback)
+            if len(X_seq) < 30:
+                continue
+
+            model = train_lstm(
+                X_seq, y_seq,
+                input_size  = n_feat,
+                hidden_size = 128,
+                num_layers  = 2,
+                dropout     = 0.3,
+                epochs      = 150,
+                patience    = 15,
+            )
+
+            # Score current bar — no leakage [i-lookback .. i-1]
+            test_raw    = raw_df.iloc[i - lookback: i][feat_cols].values.astype(np.float32)
+            test_scaled = scaler.transform(test_raw)
+            prob        = predict_lstm(model, test_scaled)
+
+            # Hard gates
+            try:
+                hour_of_row = pd.Timestamp(raw_df.index[i]).hour
+            except Exception:
+                hour_of_row = 12
+            is_bad_session = int(hour_of_row >= 20)
+            is_hakai = int(row.get("hmm_hakai", 0) > 0.5) if use_hmm else 0
+
+            meta_trade = int(prob > LSTM_THRESHOLD and not is_hakai and not is_bad_session)
+
+            results.append({
+                "timestamp":  raw_df.index[i],
+                "fwd_ret_4h": float(row["fwd_ret_4h"]),
+                "target_4h":  int(row["target_4h"]),
+                "meta_prob":  prob,
+                "meta_hit":   int(meta_trade and row["fwd_ret_4h"] > CARRY_COST),
+                "meta_trade": meta_trade,
+                "hmm_regime": int(row.get("hmm_hakai", 0) > 0.5) * 2,
+                "is_hakai":   is_hakai,
+                "is_accum":   int(row.get("hmm_accum", 0) > 0.5),
+                "vpin_z":     0.0,
+                "composite":  0.0,
+            })
+        except Exception:
+            continue
+
+    return pd.DataFrame(results)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triple-agreement ensemble: LGBM 4h ∩ LGBM 8h ∩ LSTM-raw lb=64+HMM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def walk_forward_triple_ensemble(data: dict,
+                                 lstm_lookback: int = 64,
+                                 verbose: bool = True):
+    """
+    Walk-forward backtest for the triple-agreement ensemble.
+
+    A trade fires only when ALL THREE voters agree:
+      1. LGBM 4h model  (prob > 0.50)   ─┐
+      2. LGBM 8h model  (prob > 0.50)   ─┤  walk_forward_meta()
+      3. LSTM raw lb=64+HMM (prob > 0.50)┘  walk_forward_lstm_raw()
+
+    The function runs both sub-models, inner-joins on timestamp, and
+    keeps only rows where both meta_trade columns are 1.
+
+    Returns a DataFrame compatible with score_results() where meta_trade=1
+    means the triple ensemble agreed, and meta_hit=1 means it was correct.
+
+    Also prints a side-by-side comparison of LGBM-only, LSTM-only, and
+    triple-agreement hit rates and trade counts.
+    """
+    print("  [triple] Step 1/2 — LGBM dual-horizon walk-forward...", flush=True)
+    df     = build_meta_features(data)
+    lgbm_r = walk_forward_meta(df)
+
+    print("  [triple] Step 2/2 — LSTM raw lb=64+HMM walk-forward...", flush=True)
+    lstm_r = walk_forward_lstm_raw(data, lookback=lstm_lookback, use_hmm=True)
+
+    # ── Merge on timestamp ────────────────────────────────────────────────────
+    # Both walk-forwards use STEP=6 on different base DataFrames, so their
+    # timestamp grids are offset by a few hours.  Use merge_asof (nearest
+    # within 3h tolerance) to align them without discarding valid pairs.
+    lgbm_slim = lgbm_r[["timestamp", "fwd_ret_4h", "target_4h",
+                          "meta_trade", "meta_prob",
+                          "hmm_regime", "is_hakai", "is_accum",
+                          "vpin_z", "composite"]].copy()
+    lstm_slim = lstm_r[["timestamp", "meta_trade", "meta_prob"]].rename(
+        columns={"meta_trade": "lstm_trade", "meta_prob": "lstm_prob"}
+    )
+
+    lgbm_slim = lgbm_slim.sort_values("timestamp").reset_index(drop=True)
+    lstm_slim  = lstm_slim.sort_values("timestamp").reset_index(drop=True)
+
+    # Convert to datetime if needed
+    lgbm_slim["timestamp"] = pd.to_datetime(lgbm_slim["timestamp"])
+    lstm_slim["timestamp"]  = pd.to_datetime(lstm_slim["timestamp"])
+
+    merged = pd.merge_asof(
+        lgbm_slim,
+        lstm_slim,
+        on="timestamp",
+        tolerance=pd.Timedelta("3h"),
+        direction="nearest",
+    ).dropna(subset=["lstm_trade"])
+
+    # ── Triple gate ───────────────────────────────────────────────────────────
+    merged["triple_trade"] = ((merged["meta_trade"] == 1) &
+                               (merged["lstm_trade"] == 1)).astype(int)
+    merged["triple_hit"]   = ((merged["triple_trade"] == 1) &
+                               (merged["fwd_ret_4h"] > CARRY_COST)).astype(int)
+
+    # ── Side-by-side comparison ───────────────────────────────────────────────
+    if verbose:
+        n   = len(merged)
+        bl  = merged["target_4h"].mean()
+
+        n_lgbm  = merged["meta_trade"].sum()
+        n_lstm  = merged["lstm_trade"].sum()
+        n_trip  = merged["triple_trade"].sum()
+
+        hr_lgbm = merged[merged["meta_trade"] == 1]["target_4h"].mean() if n_lgbm > 0 else 0
+        hr_lstm = merged[merged["lstm_trade"] == 1]["target_4h"].mean() if n_lstm > 0 else 0
+        hr_trip = merged[merged["triple_trade"] == 1]["target_4h"].mean() if n_trip > 0 else 0
+
+        avg_lgbm = merged[merged["meta_trade"] == 1]["fwd_ret_4h"].mean() if n_lgbm > 0 else 0
+        avg_lstm = merged[merged["lstm_trade"] == 1]["fwd_ret_4h"].mean() if n_lstm > 0 else 0
+        avg_trip = merged[merged["triple_trade"] == 1]["fwd_ret_4h"].mean() if n_trip > 0 else 0
+
+        print(f"\n  {'Model':<28} {'Trades':>7} {'% bars':>7} {'Hit%':>7} {'Lift':>7} {'AvgRet':>8}")
+        print(f"  {'-'*62}")
+        print(f"  {'Baseline (all bars)':<28} {n:>7} {'100%':>7} {bl:.1%}   {'—':>7} {merged['fwd_ret_4h'].mean():>+7.3%}")
+        print(f"  {'LGBM dual-horizon':<28} {n_lgbm:>7} {n_lgbm/n:>7.1%} {hr_lgbm:.1%}  {hr_lgbm-bl:>+6.1%}  {avg_lgbm:>+7.3%}")
+        print(f"  {'LSTM raw lb=64+HMM':<28} {n_lstm:>7} {n_lstm/n:>7.1%} {hr_lstm:.1%}  {hr_lstm-bl:>+6.1%}  {avg_lstm:>+7.3%}")
+        print(f"  {'Triple ensemble':<28} {n_trip:>7} {n_trip/n:>7.1%} {hr_trip:.1%}  {hr_trip-bl:>+6.1%}  {avg_trip:>+7.3%}")
+        print()
+
+    # ── Return triple-only rows in score_results()-compatible schema ──────────
+    triple_rows = merged[merged["triple_trade"] == 1].copy()
+    triple_rows = triple_rows.rename(columns={
+        "triple_trade": "_triple",
+        "triple_hit":   "_triple_hit",
+    })
+    # Rebuild in standard schema
+    out = pd.DataFrame({
+        "timestamp":  triple_rows["timestamp"].values,
+        "fwd_ret_4h": triple_rows["fwd_ret_4h"].values,
+        "target_4h":  triple_rows["target_4h"].values,
+        "meta_prob":  ((triple_rows["meta_prob"] + triple_rows["lstm_prob"]) / 2).values,
+        "meta_hit":   triple_rows["_triple_hit"].values,
+        "meta_trade": triple_rows["_triple"].values,
+        "hmm_regime": triple_rows["hmm_regime"].values,
+        "is_hakai":   triple_rows["is_hakai"].values,
+        "is_accum":   triple_rows["is_accum"].values,
+        "vpin_z":     triple_rows["vpin_z"].values,
+        "composite":  triple_rows["composite"].values,
+    })
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

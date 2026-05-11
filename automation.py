@@ -31,10 +31,12 @@ except ImportError:
     HAS_EXTERNAL = False
 
 try:
-    from notifiers import notify_telegram as _notify_telegram
+    from notifiers import (notify_telegram as _notify_telegram,
+                           notify_desk_setups as _notify_desk_setups)
     HAS_NOTIFIER = True
 except ImportError:
     HAS_NOTIFIER = False
+    _notify_desk_setups = None
 
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -249,6 +251,13 @@ def main():
             _notify_telegram(output)
         except Exception as _ne:
             print(f"Telegram notify: SKIP ({_ne})", file=sys.stderr)
+
+    # Push Telegram alert for newly-active desk setups (systematic signals)
+    if HAS_NOTIFIER and _notify_desk_setups and args.mode != "snapshot":
+        try:
+            _notify_desk_setups(output)
+        except Exception as _ne:
+            print(f"Telegram desk_setups notify: SKIP ({_ne})", file=sys.stderr)
 
     # Print JSON to stdout (for scheduled task to parse)
     print(json.dumps(output, indent=2, default=str))

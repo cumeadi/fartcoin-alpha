@@ -221,3 +221,83 @@ def notify_telegram(output: dict) -> None:
                 if detail:
                     _send_telegram(token, chat_id,
                                    f"⚡ <b>Alert [{severity}]:</b> {detail}")
+
+
+def notify_desk_setups(output: dict) -> None:
+    """
+    Send Telegram alerts for active systematic (desk) setups.
+
+    Fires independently of model signal tier — systematic signals are a
+    separate channel from the LGBM/LSTM ensemble.
+
+    State is tracked in data/prev_desk_setups.json to avoid repeat spam:
+    only fires when a setup becomes NEWLY active (was inactive before).
+
+    Fails silently if env vars are not set or data/desk_setups key missing.
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+
+    proj       = output.get("projections", {})
+    desk_setups = proj.get("desk_setups", {})
+    active_sigs = desk_setups.get("active_signals", [])
+
+    if not active_sigs:
+        return
+
+    # Load previous active set
+    prev_path = DATA_DIR / "prev_desk_setups.json"
+    try:
+        prev_active = set(json.loads(prev_path.read_text()).get("active", []))
+    except Exception:
+        prev_active = set()
+
+    # Persist current active set
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        prev_path.write_text(json.dumps({
+            "active": [s["id"] for s in active_sigs],
+            "updated": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception:
+        pass
+
+    # Only fire for NEWLY active setups
+    for sig in active_sigs:
+        sig_id = sig["id"]
+        if sig_id in prev_active:
+            continue  # was already active last run
+
+        direction = sig.get("direction", "")
+        label     = sig.get("label", sig_id)
+        hold_h    = sig.get("hold_h", "?")
+        size_pct  = sig.get("size_pct", 20)
+        hit_rate  = sig.get("hit_rate", 0)
+        sharpe    = sig.get("sharpe", 0)
+        avg_ret   = sig.get("avg_ret_pct", 0)
+        funding_r = sig.get("last_settle_rate") or sig.get("current_funding_rate") or 0
+        mins_settle = sig.get("mins_to_settlement") or sig.get("mins_since_settlement")
+        trades_mo = sig.get("trades_per_month", "?")
+
+        d_emoji = "📈" if direction == "LONG" else "📉"
+        now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+        msg_lines = [
+            f"⚡ <b>DESK SETUP — {label.upper()}</b>",
+            f"{d_emoji} Direction: <b>{direction}</b>",
+            f"",
+            f"📐 Size: <b>{size_pct}%</b>  |  Hold: <b>{hold_h}h</b>",
+            f"💸 Funding rate: {funding_r:.6f}",
+            (f"⏱ {mins_settle:.0f}min to settlement" if sig_id == "EXTREME_FADE" and mins_settle
+             else f"⏱ {mins_settle:.0f}min since settlement" if mins_settle else ""),
+            f"",
+            f"📊 Backtest: {hit_rate:.0%} hit | Avg +{avg_ret:.2f}% | Sharpe {sharpe:.2f}",
+            f"📅 Freq: ~{trades_mo}/mo",
+            f"",
+            f"<i>Rule-based systematic signal | {now_str}</i>",
+        ]
+
+        _send_telegram(token, chat_id,
+                       "\n".join(l for l in msg_lines if l is not None))

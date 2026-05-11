@@ -44,6 +44,13 @@ try:
 except ImportError:
     _SR_AVAILABLE = False
 
+try:
+    from systematic_signals import compute_settlement_signals as _compute_settlement_signals
+    _SYSTEMATIC_AVAILABLE = True
+except ImportError:
+    _SYSTEMATIC_AVAILABLE = False
+    _compute_settlement_signals = None
+
 from datetime import datetime, timezone
 
 from market_state import (
@@ -2786,6 +2793,15 @@ def compute_projections(data, market_state):
     settlement = _project_funding_settlement_cycle(data, market_state)
     liq_cascade = _detect_liquidation_cascade(data, market_state)
 
+    # Systematic rule-based signals (validated walk-forward)
+    desk_setups: dict = {}
+    if _SYSTEMATIC_AVAILABLE and _compute_settlement_signals is not None:
+        try:
+            desk_setups = _compute_settlement_signals(data)
+        except Exception as _se:
+            desk_setups = {"any_active": False, "signals": [], "active_signals": [],
+                           "summary": f"systematic_signals error: {_se}"}
+
     # Synthesise trade setups from all sub-models
     trade_setups = _compute_trade_setups(
         prob, mr, session, btc, settlement, cg_oi_fund, liq_cascade, market_state
@@ -2831,6 +2847,13 @@ def compute_projections(data, market_state):
     if liq_cascade.get("cascade_detected"):
         parts.append(f"*Liq Cascade:* {liq_cascade['description']}")
 
+    # Systematic rule-based signals
+    if desk_setups.get("any_active"):
+        for _sig in desk_setups.get("active_signals", []):
+            parts.append(
+                f"*⚡ Desk Setup [{_sig['id']}]:* {_sig['description']}"
+            )
+
     if ci.get("h4"):
         h4 = ci["h4"]
         thin_note = " ⚠ THIN VOLUME — bands widened" if h4.get("thin_volume") else ""
@@ -2871,5 +2894,6 @@ def compute_projections(data, market_state):
         "support_resistance": sr_levels,
         "opportunity": opportunity,
         "trade_setups": trade_setups,
+        "desk_setups": desk_setups,
         "summary": summary,
     }

@@ -1084,6 +1084,81 @@ with tab_proj:
 
     st.markdown("---")
 
+    # ── Desk Setups Panel (systematic rule-based signals) ─────────────────────
+    desk_setups  = proj.get("desk_setups", {})
+    _ds_active   = desk_setups.get("active_signals", [])
+    _ds_all      = desk_setups.get("signals", [])
+    _ds_summary  = desk_setups.get("summary", "")
+    _ds_next_set = desk_setups.get("next_settlement", "—")
+    _ds_mins     = desk_setups.get("mins_to_next", None)
+    _ds_cur_fund = desk_setups.get("current_funding_rate", None)
+
+    st.markdown("#### ⚡ Desk Setups")
+    st.caption("Rule-based systematic signals — validated walk-forward (Dec 2024–May 2026)")
+
+    if _ds_active:
+        for _ds in _ds_active:
+            _dir = _ds.get("direction", "LONG")
+            _dir_color = "#1b5e20" if _dir == "LONG" else "#b71c1c"
+            _dir_icon  = "📈 LONG" if _dir == "LONG" else "📉 SHORT"
+            _hit  = _ds.get("hit_rate", 0)
+            _sh   = _ds.get("sharpe", 0)
+            _avg  = _ds.get("avg_ret_pct", 0)
+            _freq = _ds.get("trades_per_month", "?")
+            _hold = _ds.get("hold_h", "?")
+            _size = _ds.get("size_pct", 20)
+            _trig = _ds.get("trigger", "")
+            st.markdown(
+                f'<div style="background:{_dir_color}33;border:1.5px solid {_dir_color};'
+                f'border-radius:8px;padding:14px 18px;margin-bottom:10px">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'margin-bottom:6px">'
+                f'<b style="color:{_dir_color};font-size:1.05rem">⚡ {_ds.get("label","").upper()}</b>'
+                f'<span style="background:{_dir_color};color:#fff;border-radius:4px;'
+                f'padding:3px 10px;font-size:0.8rem;font-weight:700">{_dir_icon}</span>'
+                f'</div>'
+                f'<div style="font-size:0.82rem;color:#ccc;margin-bottom:8px">{_trig}</div>'
+                f'<div style="display:flex;gap:20px;font-size:0.85rem">'
+                f'<span>📐 Size: <b style="color:#fff">{_size}%</b></span>'
+                f'<span>⏱ Hold: <b style="color:#fff">{_hold}h</b></span>'
+                f'<span>🎯 Hit: <b style="color:#fff">{_hit:.0%}</b></span>'
+                f'<span>📊 Sharpe: <b style="color:#fff">{_sh:.2f}</b></span>'
+                f'<span>📅 ~{_freq}/mo</span>'
+                f'</div>'
+                f'<div style="font-size:0.78rem;color:#aaa;margin-top:6px">'
+                f'Backtest avg: <b style="color:#fff">+{_avg:.2f}%</b> per trade</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        # Show inactive state with timing context
+        _fund_str = f"{_ds_cur_fund:.6f}" if _ds_cur_fund else "—"
+        _mins_str = f"{_ds_mins:.0f}min" if _ds_mins is not None else "—"
+        st.markdown(
+            f'<div style="background:#1a2327;border-left:3px solid #37474f;border-radius:6px;'
+            f'padding:10px 14px;font-size:0.85rem;color:#78909c">'
+            f'⏸ <b>No systematic setups active</b> &nbsp;|&nbsp; '
+            f'Next settlement: <b style="color:#b0bec5">{_ds_next_set}</b> '
+            f'({_mins_str} away) &nbsp;|&nbsp; '
+            f'Current funding: <b style="color:#b0bec5">{_fund_str}</b>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Show all signals in an expander for context
+    if _ds_all:
+        with st.expander("📋 All systematic signals — status detail"):
+            for _sig in _ds_all:
+                _col = "🟢" if _sig.get("active") else "⚫"
+                st.markdown(
+                    f"{_col} **{_sig.get('label', _sig['id'])}** "
+                    f"({_sig.get('direction','?')}, {_sig.get('hold_h','?')}h hold, "
+                    f"{_sig.get('size_pct',20)}% size) — "
+                    f"{_sig.get('reason', _sig.get('description',''))}"
+                )
+
+    st.markdown("---")
+
     # ── Row 1: Probability + Manipulation cycle ───────────────────────────────
     r1a, r1b = st.columns([3, 2])
 

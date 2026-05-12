@@ -1147,17 +1147,26 @@ with tab_engine:
                               fillcolor="rgba(100,181,246,0.06)", line_width=0,
                               layer="below", row=1, col=1)
             for _lv in _levels:
-                _lp  = _lv.get("price", 0)
-                _lt  = _lv.get("type", "support")
-                _ls  = _lv.get("strength", 0.5)
-                _rgb = (f"rgba(239,154,154,{0.4+0.5*_ls:.2f})" if _lt == "resistance"
-                        else f"rgba(165,214,167,{0.4+0.5*_ls:.2f})")
+                _lp      = _lv.get("price", 0)
+                _lt      = _lv.get("type", "support")
+                _ls      = _lv.get("strength", 0.5)
+                _methods = _lv.get("methods", [])
+                _is_liq  = "liq_cluster" in _methods
+                if _is_liq:
+                    _rgb  = f"rgba(255,183,77,{0.5+0.4*_ls:.2f})"  # amber for liq magnets
+                    _dash = "dashdot"
+                elif _lt == "resistance":
+                    _rgb  = f"rgba(239,154,154,{0.4+0.5*_ls:.2f})"
+                    _dash = "solid" if _ls >= 0.7 else "dot"
+                else:
+                    _rgb  = f"rgba(165,214,167,{0.4+0.5*_ls:.2f})"
+                    _dash = "solid" if _ls >= 0.7 else "dot"
                 fig.add_shape(type="line", x0=_x0, x1=_x1, y0=_lp, y1=_lp,
-                              line=dict(color=_rgb, width=0.8+1.2*_ls,
-                                        dash="solid" if _ls >= 0.7 else "dot"),
+                              line=dict(color=_rgb, width=0.8+1.2*_ls, dash=_dash),
                               row=1, col=1)
-                _dist = (_lp - _cur_p) / (_cur_p + 1e-9) * 100
-                _lbl  = f"{'R' if _lt=='resistance' else 'S'} ${_lp:.4f} {_dist:+.1f}%"
+                _dist    = (_lp - _cur_p) / (_cur_p + 1e-9) * 100
+                _liq_tag = " ⚡" if _is_liq else ""
+                _lbl     = f"{'R' if _lt=='resistance' else 'S'} ${_lp:.4f} {_dist:+.1f}%{_liq_tag}"
                 fig.add_annotation(x=_x1, y=_lp, xref="x", yref="y",
                                    text=_lbl, showarrow=False,
                                    font=dict(size=8, color=_rgb),

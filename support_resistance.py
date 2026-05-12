@@ -255,6 +255,7 @@ def _merge_levels(candidates, merge_pct=MERGE_PCT):
         if any(g.get("is_vol")   for g in group): methods.append("volume_node")
         if any(g.get("is_swing") for g in group): methods.append("swing")
         if any(g.get("is_round") for g in group): methods.append("round_number")
+        if any(g.get("is_liq")   for g in group): methods.append("liq_cluster")
 
         result.append({
             "price":     avg_price,
@@ -356,6 +357,32 @@ def compute_sr_levels(data, lookback=VOL_LOOKBACK, n_levels=8):
                 "price": price_lvl, "vol_score": 0.0,
                 "is_vol": False, "is_swing": False, "is_round": True,
             })
+
+        # 4. Liquidation cluster magnets — price at time of large liq events
+        liq_df = data.get("liquidations")
+        if liq_df is not None and not liq_df.empty and "liq_zscore" in liq_df.columns:
+            try:
+                liq_thresh = liq_df["liq_zscore"].quantile(0.85)  # top 15% events
+                big_liqs   = liq_df[liq_df["liq_zscore"] >= max(liq_thresh, 1.5)]
+                if not big_liqs.empty:
+                    price_idx  = prices_s.index
+                    for liq_ts in big_liqs.index:
+                        # Align liq timestamp to nearest OHLCV hour
+                        liq_ts_naive = liq_ts.replace(tzinfo=None) if hasattr(liq_ts, 'tzinfo') and liq_ts.tzinfo else liq_ts
+                        near = price_idx[price_idx.searchsorted(liq_ts_naive, side="left"):
+                                         price_idx.searchsorted(liq_ts_naive, side="left") + 1]
+                        if near.empty:
+                            continue
+                        p_at_liq = float(prices_s.loc[near[0]])
+                        if price_min * 0.95 <= p_at_liq <= price_max * 1.05:
+                            liq_vol  = float(big_liqs.loc[liq_ts, "liq_zscore"]) / 10.0
+                            candidates.append({
+                                "price": p_at_liq, "vol_score": min(liq_vol, 0.8),
+                                "is_vol": False, "is_swing": False,
+                                "is_round": False, "is_liq": True,
+                            })
+            except Exception:
+                pass
 
         if not candidates:
             return _empty

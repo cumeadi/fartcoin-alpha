@@ -208,6 +208,29 @@ _next_settle = desk_setups.get("next_settlement", "—")
 _mins_settle = desk_setups.get("mins_to_next", None)
 _cur_fund    = desk_setups.get("current_funding_rate") or avg_funding
 
+_sq          = proj.get("squeeze_scorecard", {})
+_sq_score    = _sq.get("score", 0)
+_sq_status   = _sq.get("status", "LOW")
+_sq_avail    = _sq.get("available", False)
+_sq_comps    = _sq.get("components", {})
+_sq_base_rt  = _sq.get("historical_base_rate_pct")
+_sq_n        = _sq.get("historical_sample_n", 0)
+
+_hk          = proj.get("hakai_exit_playbook", {})
+_hk_avail    = _hk.get("available", False)
+_hk_in_hakai = _hk.get("in_hakai", False)
+_hk_dur      = _hk.get("current_duration_h")
+_hk_median   = _hk.get("median_duration_h")
+_hk_p75      = _hk.get("p75_duration_h")
+_hk_p1       = _hk.get("p_exit_1h")
+_hk_p2       = _hk.get("p_exit_2h")
+_hk_p4       = _hk.get("p_exit_4h")
+_hk_post_ret = _hk.get("post_exit_4h_mean_pct")
+_hk_post_pos = _hk.get("post_exit_4h_pos_pct")
+_hk_neg_ret  = _hk.get("neg_fund_mean_pct")
+_hk_neg_pos  = _hk.get("neg_fund_pos_pct")
+_hk_badge    = _hk.get("badge", "STAND_ASIDE")
+
 # Freshness badge
 _fresh_str = ""
 if _data_age_min is not None:
@@ -703,7 +726,157 @@ with tab_desk:
         unsafe_allow_html=True,
     )
 
-    # ── 1f. Next opportunity (when no signal active) ──────────────────────────
+    # ── 1f. Squeeze Setup Scorecard (shown during STAND_ASIDE / WATCH) ──────────
+    if _sq_avail and _scenario in ("STAND_ASIDE", "WATCH", "SYSTEMATIC_ONLY"):
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        _sq_colors = {"EXTREME": "#ef5350", "HIGH": "#ff7043", "MODERATE": "#f9a825", "LOW": "#546e7a"}
+        _sq_bgs    = {"EXTREME": "#1a0000", "HIGH": "#1a0800", "MODERATE": "#1a1200", "LOW": "#0d1117"}
+        _sq_c      = _sq_colors.get(_sq_status, "#546e7a")
+        _sq_bg     = _sq_bgs.get(_sq_status, "#0d1117")
+        _sq_label  = {"EXTREME": "⚡ EXTREME SQUEEZE PRESSURE", "HIGH": "🟠 HIGH SQUEEZE PRESSURE",
+                      "MODERATE": "🟡 MODERATE — BUILDING", "LOW": "⚫ LOW — NO CROWDING"}.get(_sq_status, _sq_status)
+
+        # Component bar scores
+        _lsr_c   = _sq_comps.get("lsr", {})
+        _fund_c  = _sq_comps.get("funding", {})
+        _oi_c    = _sq_comps.get("oi", {})
+        _gl_c    = _sq_comps.get("ghost_long", {})
+
+        def _comp_bar(label, score, detail="", color="#f9a825"):
+            pct = score / 25 * 100
+            return (
+                f'<div style="margin-bottom:8px">'
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:0.75rem;color:#9e9e9e;margin-bottom:3px">'
+                f'<span>{label}</span><span style="color:{color}">{score}/25 {detail}</span></div>'
+                f'<div style="background:#1e1e1e;border-radius:3px;height:6px">'
+                f'<div style="background:{color};height:6px;border-radius:3px;width:{pct:.0f}%"></div>'
+                f'</div></div>'
+            )
+
+        _lsr_detail  = f'(LSR {_lsr_c.get("pct","?")}th pct)' if _lsr_c.get("pct") is not None else ""
+        _fund_detail = f'({_fund_c.get("rate","?"):.6f})' if _fund_c.get("rate") is not None else ""
+        _oi_detail   = f'(OI {_oi_c.get("chg_4h_pct","?"):+.2f}% 4h)' if _oi_c.get("chg_4h_pct") is not None else ""
+        _gl_detail   = f'(vel {_gl_c.get("vel_z","?"):+.1f}σ)' if _gl_c.get("vel_z") is not None else ""
+
+        _base_note = (f'When score&gt;70: <b style="color:{_sq_c}">{_sq_base_rt:.0f}%</b> reversed up '
+                      f'in 8h ({_sq_n} historical cases)' if _sq_base_rt and _sq_n else "")
+
+        st.markdown(
+            f'<div style="background:{_sq_bg};border:1.5px solid {_sq_c}55;border-radius:10px;'
+            f'padding:16px 20px">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+            f'margin-bottom:12px">'
+            f'<div>'
+            f'<div class="section-label">Short Squeeze Pressure Scorecard</div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:{_sq_c}">{_sq_label}</div>'
+            f'</div>'
+            f'<div style="text-align:center;background:#1e1e1e;border-radius:50%;'
+            f'width:70px;height:70px;display:flex;align-items:center;justify-content:center;'
+            f'border:3px solid {_sq_c}">'
+            f'<div style="font-size:1.6rem;font-weight:800;color:{_sq_c};line-height:1">'
+            f'{_sq_score}<div style="font-size:0.6rem;color:#546e7a;font-weight:400">/100</div></div>'
+            f'</div>'
+            f'</div>'
+            f'{_comp_bar("LSR Positioning", _lsr_c.get("score",0), _lsr_detail)}'
+            f'{_comp_bar("Funding Direction", _fund_c.get("score",0), _fund_detail)}'
+            f'{_comp_bar("OI Trend", _oi_c.get("score",0), _oi_detail)}'
+            f'{_comp_bar("Ghost Long Velocity", _gl_c.get("score",0), _gl_detail)}'
+            + (f'<div style="border-top:1px solid #21262d;padding-top:10px;margin-top:4px;'
+               f'font-size:0.78rem;color:#9e9e9e">{_base_note}</div>' if _base_note else "") +
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── 1g. HAKAI Exit Playbook (shown when in HAKAI or just ended) ───────────
+    if _hk_avail and (_hk_in_hakai or _hk_badge == "HAKAI_ENDED"):
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        _hk_badge_color = {"PREPARE_SOON": "#ff7043", "STAND_ASIDE": "#546e7a",
+                           "HAKAI_ENDED": "#4caf50"}.get(_hk_badge, "#546e7a")
+        _hk_badge_label = {"PREPARE_SOON": "⚠ PREPARE — HAKAI ENDING SOON",
+                           "STAND_ASIDE":  "⛔ HAKAI — STAND ASIDE",
+                           "HAKAI_ENDED":  "✅ HAKAI ENDED — POST-HAKAI WINDOW"}.get(_hk_badge, _hk_badge)
+
+        # Build duration bar
+        _hk_dur_pct  = min((_hk_dur or 0) / max(_hk_p75 or 5, 1) * 100, 100)
+        _hk_med_pct  = min((_hk_median or 2) / max(_hk_p75 or 5, 1) * 100, 100)
+
+        st.markdown(
+            f'<div style="background:#0d1117;border:1.5px solid {_hk_badge_color}55;'
+            f'border-radius:10px;padding:16px 20px">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;'
+            f'margin-bottom:14px">'
+            f'<div>'
+            f'<div class="section-label">HAKAI Exit Playbook</div>'
+            f'<div style="font-size:1.05rem;font-weight:700;color:{_hk_badge_color}">'
+            f'{_hk_badge_label}</div>'
+            + (f'<div style="color:#9e9e9e;font-size:0.8rem;margin-top:2px">'
+               f'In HAKAI {_hk_dur:.1f}h (median {_hk_median:.1f}h, P75={_hk_p75:.1f}h)</div>'
+               if _hk_dur and _hk_median and _hk_p75 and _hk_in_hakai else
+               (f'<div style="color:#9e9e9e;font-size:0.8rem;margin-top:2px">'
+                f'HAKAI lasted {_hk_dur:.1f}h (median {_hk_median:.1f}h)</div>'
+                if _hk_dur and _hk_median else "")) +
+            f'</div>'
+            f'</div>'
+            # Duration bar
+            + (f'<div style="background:#1e1e1e;border-radius:4px;height:8px;'
+               f'margin-bottom:4px;position:relative">'
+               f'<div style="background:{_hk_badge_color};height:8px;border-radius:4px;'
+               f'width:{_hk_dur_pct:.0f}%"></div>'
+               f'<div style="position:absolute;left:{_hk_med_pct:.0f}%;top:-6px;'
+               f'font-size:0.6rem;color:#f9a825">median</div>'
+               f'</div>'
+               f'<div style="display:flex;justify-content:space-between;'
+               f'font-size:0.68rem;color:#546e7a;margin-bottom:12px">'
+               f'<span>0h</span><span style="color:#f9a825">{_hk_median:.1f}h median</span>'
+               f'<span>P75={_hk_p75:.1f}h</span></div>'
+               if _hk_dur and _hk_median and _hk_p75 else "") +
+            # Exit probability
+            f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;'
+            f'margin-bottom:12px">'
+            + (f'<div style="background:#111618;border-radius:6px;padding:10px;text-align:center">'
+               f'<div style="color:#546e7a;font-size:0.68rem;font-weight:700">P(EXIT ≤1h)</div>'
+               f'<div style="font-size:1.2rem;font-weight:700;color:{_hk_badge_color}">'
+               f'{_hk_p1:.0%}</div></div>'
+               f'<div style="background:#111618;border-radius:6px;padding:10px;text-align:center">'
+               f'<div style="color:#546e7a;font-size:0.68rem;font-weight:700">P(EXIT ≤2h)</div>'
+               f'<div style="font-size:1.2rem;font-weight:700;color:{_hk_badge_color}">'
+               f'{_hk_p2:.0%}</div></div>'
+               f'<div style="background:#111618;border-radius:6px;padding:10px;text-align:center">'
+               f'<div style="color:#546e7a;font-size:0.68rem;font-weight:700">P(EXIT ≤4h)</div>'
+               f'<div style="font-size:1.2rem;font-weight:700;color:{_hk_badge_color}">'
+               f'{_hk_p4:.0%}</div></div>'
+               if _hk_p1 is not None and _hk_p2 is not None and _hk_p4 is not None else "") +
+            f'</div>'
+            # Post-HAKAI returns
+            + (f'<div style="border-top:1px solid #21262d;padding-top:10px;'
+               f'display:grid;grid-template-columns:1fr 1fr;gap:12px">'
+               f'<div style="font-size:0.78rem">'
+               f'<div style="color:#546e7a;font-size:0.68rem;font-weight:700;margin-bottom:4px">'
+               f'ALL POST-HAKAI EXITS (4h)</div>'
+               f'<div style="color:#ccc">Avg return: '
+               f'<b style="color:{"#4caf50" if _hk_post_ret > 0 else "#ef5350"}">'
+               f'{_hk_post_ret:+.2f}%</b></div>'
+               f'<div style="color:#9e9e9e">% positive: {_hk_post_pos:.0f}%</div>'
+               f'</div>'
+               + (f'<div style="font-size:0.78rem">'
+                  f'<div style="color:#546e7a;font-size:0.68rem;font-weight:700;margin-bottom:4px">'
+                  f'NEG FUNDING EXITS</div>'
+                  f'<div style="color:#ccc">Avg return: '
+                  f'<b style="color:{"#4caf50" if _hk_neg_ret > 0 else "#ef5350"}">'
+                  f'{_hk_neg_ret:+.2f}%</b></div>'
+                  f'<div style="color:#9e9e9e">% positive: {_hk_neg_pos:.0f}%</div>'
+                  f'</div>'
+                  if _hk_neg_ret is not None and _hk_neg_pos is not None else "") +
+               f'</div>'
+               if _hk_post_ret is not None and _hk_post_pos is not None else "") +
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── 1h. Next opportunity (when no signal active) ──────────────────────────
     if _scenario in ("STAND_ASIDE", "WATCH") and not _sys_active:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="section-label">What Would Fire Next</div>',

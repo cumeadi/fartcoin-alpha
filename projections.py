@@ -2569,6 +2569,379 @@ def _compute_vpin_proxy(data):
 
 
 # =========================================================================
+# 10. Squeeze Setup Scorecard — Composite short-squeeze pressure index
+# =========================================================================
+
+def compute_squeeze_scorecard(data, ghost_long=None) -> dict:
+    """
+    0–100 composite index measuring short-squeeze pressure building in the market.
+
+    Components (each 0–25 pts):
+      1. LSR percentile  — lower = more shorts = more squeeze fuel
+      2. Funding sign    — negative funding = shorts paying = crowded short
+      3. OI trend        — rising OI with negative funding = accumulating short pressure
+      4. Ghost Long vel  — positive Binance velocity = smart money buying while retail short
+
+    Historical base rate: when score > 70, price reversed upward within 8h in X% of cases.
+    """
+    result = {
+        "score": 0,
+        "components": {},
+        "historical_base_rate_pct": None,
+        "historical_sample_n": 0,
+        "status": "LOW",
+        "description": "Insufficient data.",
+        "available": False,
+    }
+
+    try:
+        lsr_df    = data.get("lsr")
+        fund_df   = data.get("funding")
+        oi_df     = data.get("oi")
+        ohlcv     = data.get("ohlcv")
+
+        score = 0
+        components: dict = {}
+
+        # ── Component 1: LSR percentile (0–25 pts) ────────────────────────
+        lsr_score = 0
+        lsr_pct_val = None
+        if lsr_df is not None and not lsr_df.empty:
+            lsr_col = next((c for c in lsr_df.columns if "lsr" in c.lower() or "ratio" in c.lower()), lsr_df.columns[0])
+            lsr_series = lsr_df[lsr_col].dropna()
+            if len(lsr_series) >= 10:
+                last_lsr = float(lsr_series.iloc[-1])
+                lsr_pct_val = float((lsr_series <= last_lsr).mean())
+                # Low LSR = crowded shorts = squeeze fuel
+                if lsr_pct_val <= 0.05:
+                    lsr_score = 25
+                elif lsr_pct_val <= 0.15:
+                    lsr_score = 20
+                elif lsr_pct_val <= 0.30:
+                    lsr_score = 12
+                elif lsr_pct_val <= 0.50:
+                    lsr_score = 5
+        components["lsr"] = {"score": lsr_score, "pct": round(lsr_pct_val * 100, 1) if lsr_pct_val is not None else None}
+        score += lsr_score
+
+        # ── Component 2: Funding direction (0–25 pts) ────────────────────
+        fund_score = 0
+        fund_val   = None
+        if fund_df is not None and not fund_df.empty:
+            fund_col = "fundingRate" if "fundingRate" in fund_df.columns else fund_df.columns[0]
+            fund_val = float(fund_df[fund_col].iloc[-1])
+            if fund_val < -0.0003:
+                fund_score = 25   # very negative = heavily short-crowded
+            elif fund_val < -0.0001:
+                fund_score = 18
+            elif fund_val < 0:
+                fund_score = 10   # slightly negative
+            elif fund_val < 0.0001:
+                fund_score = 3    # neutral — slight pressure
+        components["funding"] = {"score": fund_score, "rate": round(fund_val, 6) if fund_val is not None else None}
+        score += fund_score
+
+        # ── Component 3: OI trend (0–25 pts) ─────────────────────────────
+        oi_score = 0
+        oi_chg_4h = None
+        if oi_df is not None and len(oi_df) >= 5:
+            oi_col = oi_df.columns[0]
+            oi_series = oi_df[oi_col].dropna()
+            if len(oi_series) >= 5:
+                oi_now   = float(oi_series.iloc[-1])
+                oi_4h    = float(oi_series.iloc[-5])
+                if oi_4h > 0:
+                    oi_chg_4h = (oi_now - oi_4h) / oi_4h
+                    # Rising OI + negative funding = shorts adding = more squeeze fuel
+                    if fund_val is not None and fund_val < 0:
+                        if oi_chg_4h > 0.02:
+                            oi_score = 25
+                        elif oi_chg_4h > 0.005:
+                            oi_score = 15
+                        elif oi_chg_4h > 0:
+                            oi_score = 8
+                    elif fund_val is not None and fund_val >= 0:
+                        # OI rising with positive funding = longs adding = slight bullish
+                        if oi_chg_4h > 0.02:
+                            oi_score = 8
+        components["oi"] = {"score": oi_score, "chg_4h_pct": round(oi_chg_4h * 100, 2) if oi_chg_4h is not None else None}
+        score += oi_score
+
+        # ── Component 4: Ghost Long velocity (0–25 pts) ──────────────────
+        gl_score = 0
+        vel_z    = None
+        if ghost_long is not None and ghost_long.get("velocity_zscore") is not None:
+            vel_z = float(ghost_long["velocity_zscore"])
+            # Positive z = Binance funding rising faster than Bybit = smart money buying
+            if vel_z >= 2.0:
+                gl_score = 25
+            elif vel_z >= 1.5:
+                gl_score = 18
+            elif vel_z >= 1.0:
+                gl_score = 10
+            elif vel_z >= 0.5:
+                gl_score = 5
+        components["ghost_long"] = {"score": gl_score, "vel_z": round(vel_z, 2) if vel_z is not None else None}
+        score += gl_score
+
+        # ── Historical base rate (score > 70 → 8h forward return) ───────
+        base_rate_pct = None
+        sample_n      = 0
+        if ohlcv is not None and fund_df is not None and lsr_df is not None and len(ohlcv) >= 50:
+            try:
+                price_col = "price" if "price" in ohlcv.columns else "close"
+                prices    = ohlcv[price_col].dropna()
+                fund_col_  = "fundingRate" if "fundingRate" in fund_df.columns else fund_df.columns[0]
+                lsr_col_  = next((c for c in lsr_df.columns if "lsr" in c.lower() or "ratio" in c.lower()), lsr_df.columns[0])
+
+                # Align data on hourly OHLCV timestamps
+                fund_aligned = fund_df[fund_col_].reindex(prices.index, method="ffill")
+                lsr_aligned  = lsr_df[lsr_col_].reindex(prices.index, method="ffill")
+
+                # LSR historical percentile
+                lsr_roll_pct = lsr_aligned.expanding(min_periods=20).rank(pct=True)
+
+                # Quick proxy score at each bar (simplified: fund < 0 AND lsr_pct < 0.2)
+                high_score_mask = (fund_aligned < -0.0001) & (lsr_roll_pct < 0.20)
+                high_score_idx  = prices.index[high_score_mask]
+
+                # For each high-score bar, check 8h forward return
+                reversals = []
+                for ts in high_score_idx:
+                    future_idx = prices.index[prices.index >= ts + pd.Timedelta("8h")]
+                    if future_idx.empty:
+                        continue
+                    p_now  = float(prices.loc[ts])
+                    p_8h   = float(prices.loc[future_idx[0]])
+                    if p_now > 0:
+                        reversals.append((p_8h - p_now) / p_now > 0)
+
+                if len(reversals) >= 10:
+                    base_rate_pct = round(sum(reversals) / len(reversals) * 100, 1)
+                    sample_n      = len(reversals)
+            except Exception:
+                pass
+
+        # ── Classify status ───────────────────────────────────────────────
+        if score >= 75:
+            status = "EXTREME"
+        elif score >= 55:
+            status = "HIGH"
+        elif score >= 35:
+            status = "MODERATE"
+        else:
+            status = "LOW"
+
+        # ── Description ──────────────────────────────────────────────────
+        base_str = (f" Historical setup hit rate: {base_rate_pct:.0f}% ({sample_n} cases)." if base_rate_pct else "")
+        if status == "EXTREME":
+            desc = (f"⚡ EXTREME SQUEEZE PRESSURE ({score}/100) — "
+                    f"LSR at {components['lsr'].get('pct','?')}th pct, "
+                    f"funding {fund_val:.6f}, OI {'rising' if (oi_chg_4h or 0)>0 else 'flat'}, "
+                    f"Ghost Long vel {vel_z:+.1f}σ.{base_str}")
+        elif status == "HIGH":
+            desc = (f"🟠 HIGH SQUEEZE PRESSURE ({score}/100) — "
+                    f"Multiple bearish-positioning signals building.{base_str}")
+        elif status == "MODERATE":
+            desc = f"🟡 MODERATE squeeze pressure ({score}/100) — setup building.{base_str}"
+        else:
+            desc = f"Squeeze pressure LOW ({score}/100) — no significant short crowding."
+
+        result.update({
+            "score":                   score,
+            "components":              components,
+            "historical_base_rate_pct": base_rate_pct,
+            "historical_sample_n":     sample_n,
+            "status":                  status,
+            "description":             desc,
+            "available":               True,
+        })
+
+    except Exception as e:
+        result["description"] = f"Squeeze scorecard error: {e}"
+
+    return result
+
+
+# =========================================================================
+# 11. HAKAI Exit Playbook — Duration distribution + first-bar post-HAKAI stats
+# =========================================================================
+
+def compute_hakai_exit_playbook(data) -> dict:
+    """
+    Analyses historical HAKAI episodes to:
+      1. Build duration distribution (median, P25, P75, max)
+      2. Compute P(exit within 1h/2h/4h | currently Xh in)
+      3. Compute first-4h post-HAKAI returns, split by funding sign at exit
+      4. Decide badge: STAND_ASIDE vs PREPARE_SOON (if past median)
+
+    Requires build_meta_features() which calls hmm_engine — only runs when
+    _SCORER_AVAILABLE and hmm_engine is present.
+    """
+    result = {
+        "current_duration_h":    None,
+        "median_duration_h":     None,
+        "p25_duration_h":        None,
+        "p75_duration_h":        None,
+        "p_exit_1h":             None,
+        "p_exit_2h":             None,
+        "p_exit_4h":             None,
+        "post_exit_4h_mean_pct": None,
+        "post_exit_4h_pos_pct":  None,
+        "neg_fund_mean_pct":     None,
+        "neg_fund_pos_pct":      None,
+        "pos_fund_mean_pct":     None,
+        "pos_fund_pos_pct":      None,
+        "badge":                 "STAND_ASIDE",
+        "in_hakai":              False,
+        "available":             False,
+        "description":           "HAKAI playbook: insufficient data.",
+    }
+
+    if not _SCORER_AVAILABLE:
+        return result
+
+    try:
+        from trade_scorer import build_meta_features
+        import numpy as np
+
+        df   = build_meta_features(data)
+        ohlcv  = data.get("ohlcv")
+        fund_df = data.get("funding")
+
+        if df is None or "hmm_hakai" not in df.columns:
+            return result
+
+        hakai = df["hmm_hakai"].fillna(0).astype(int)
+
+        # ── Extract episodes ──────────────────────────────────────────────
+        episodes = []
+        in_hakai  = False
+        start_ts  = None
+        for ts, val in hakai.items():
+            if val == 1 and not in_hakai:
+                in_hakai = True
+                start_ts = ts
+            elif val == 0 and in_hakai:
+                in_hakai = False
+                episodes.append({"start": start_ts, "end": ts, "open": False})
+        if in_hakai and start_ts is not None:
+            episodes.append({"start": start_ts, "end": df.index[-1], "open": True})
+
+        if not episodes:
+            return result
+
+        current_ep = episodes[-1]
+        complete_eps = [e for e in episodes if not e["open"]]
+
+        all_durs = [(e["end"] - e["start"]).total_seconds() / 3600 for e in complete_eps]
+
+        if not all_durs:
+            return result
+
+        arr = np.array(all_durs)
+        median_h = float(np.median(arr))
+        p25_h    = float(np.percentile(arr, 25))
+        p75_h    = float(np.percentile(arr, 75))
+
+        # ── Current episode duration ──────────────────────────────────────
+        current_h = (current_ep["end"] - current_ep["start"]).total_seconds() / 3600
+        in_hakai_now = current_ep["open"]
+
+        # ── P(exit within Xh | currently Yh in) ──────────────────────────
+        eligible = arr[arr >= current_h]
+        if len(eligible) > 0:
+            p1 = float(np.mean(eligible <= current_h + 1))
+            p2 = float(np.mean(eligible <= current_h + 2))
+            p4 = float(np.mean(eligible <= current_h + 4))
+        else:
+            # Past max — exit overdue; set high probability
+            p1, p2, p4 = 0.90, 0.95, 0.99
+
+        # ── Post-exit returns ─────────────────────────────────────────────
+        pos_rets   = []
+        neg_rets   = []
+        all_rets   = []
+        if ohlcv is not None:
+            price_col = "price" if "price" in ohlcv.columns else "close"
+            fund_col  = "fundingRate" if fund_df is not None and "fundingRate" in (fund_df.columns if fund_df is not None else []) else None
+
+            for ep in complete_eps:
+                exit_ts = ep["end"]
+                ep_rows = ohlcv[ohlcv.index >= exit_ts].head(1)
+                fut_rows = ohlcv[ohlcv.index >= exit_ts + pd.Timedelta("4h")].head(1)
+                if ep_rows.empty or fut_rows.empty:
+                    continue
+                ep_price  = float(ep_rows[price_col].iloc[0])
+                fut_price = float(fut_rows[price_col].iloc[0])
+                if ep_price <= 0:
+                    continue
+                ret = (fut_price - ep_price) / ep_price * 100
+
+                # Funding sign at exit
+                fund_sign = None
+                if fund_df is not None and fund_col and not fund_df.empty:
+                    fc_rows = fund_df[fund_df.index >= exit_ts].head(1)
+                    if not fc_rows.empty:
+                        fund_sign = "neg" if float(fc_rows[fund_col].iloc[0]) < 0 else "pos"
+
+                all_rets.append(ret)
+                if fund_sign == "neg":
+                    neg_rets.append(ret)
+                elif fund_sign == "pos":
+                    pos_rets.append(ret)
+
+        post_mean   = float(np.mean(all_rets))  if all_rets  else None
+        post_pos    = float(np.mean([r > 0 for r in all_rets]))  if all_rets  else None
+        neg_mean    = float(np.mean(neg_rets))  if neg_rets  else None
+        neg_pos_pct = float(np.mean([r > 0 for r in neg_rets]))  if neg_rets  else None
+        pos_mean    = float(np.mean(pos_rets))  if pos_rets  else None
+        pos_pos_pct = float(np.mean([r > 0 for r in pos_rets]))  if pos_rets  else None
+
+        # ── Badge ─────────────────────────────────────────────────────────
+        badge = "STAND_ASIDE"
+        if in_hakai_now and current_h >= median_h * 0.80:
+            badge = "PREPARE_SOON"
+        elif not in_hakai_now:
+            badge = "HAKAI_ENDED"
+
+        # ── Description ──────────────────────────────────────────────────
+        if in_hakai_now:
+            desc = (
+                f"HAKAI active {current_h:.1f}h (median {median_h:.1f}h, P75={p75_h:.1f}h). "
+                f"P(exit ≤1h): {p1:.0%} | P(exit ≤2h): {p2:.0%} | P(exit ≤4h): {p4:.0%}. "
+                + (f"Post-HAKAI 4h: avg {post_mean:+.2f}%, {post_pos:.0%} positive." if post_mean is not None else "")
+            )
+        else:
+            desc = f"HAKAI recently ended after {current_h:.1f}h."
+
+        result.update({
+            "current_duration_h":    round(current_h, 1),
+            "median_duration_h":     round(median_h, 1),
+            "p25_duration_h":        round(p25_h, 1),
+            "p75_duration_h":        round(p75_h, 1),
+            "p_exit_1h":             round(p1, 3),
+            "p_exit_2h":             round(p2, 3),
+            "p_exit_4h":             round(p4, 3),
+            "post_exit_4h_mean_pct": round(post_mean, 2) if post_mean is not None else None,
+            "post_exit_4h_pos_pct":  round(post_pos * 100, 1) if post_pos is not None else None,
+            "neg_fund_mean_pct":     round(neg_mean, 2) if neg_mean is not None else None,
+            "neg_fund_pos_pct":      round(neg_pos_pct * 100, 1) if neg_pos_pct is not None else None,
+            "pos_fund_mean_pct":     round(pos_mean, 2) if pos_mean is not None else None,
+            "pos_fund_pos_pct":      round(pos_pos_pct * 100, 1) if pos_pos_pct is not None else None,
+            "badge":                 badge,
+            "in_hakai":              in_hakai_now,
+            "available":             True,
+            "description":           desc,
+        })
+
+    except Exception as e:
+        result["description"] = f"HAKAI playbook error: {e}"
+
+    return result
+
+
+# =========================================================================
 
 def compute_projections(data, market_state):
     """
@@ -2802,6 +3175,20 @@ def compute_projections(data, market_state):
             desk_setups = {"any_active": False, "signals": [], "active_signals": [],
                            "summary": f"systematic_signals error: {_se}"}
 
+    # Squeeze Setup Scorecard — short-squeeze pressure index
+    squeeze_scorecard: dict = {}
+    try:
+        squeeze_scorecard = compute_squeeze_scorecard(data, ghost_long=ghost_long)
+    except Exception as _sse:
+        squeeze_scorecard = {"available": False, "description": f"squeeze error: {_sse}"}
+
+    # HAKAI Exit Playbook — duration distribution + post-HAKAI stats
+    hakai_exit_playbook: dict = {}
+    try:
+        hakai_exit_playbook = compute_hakai_exit_playbook(data)
+    except Exception as _hpe:
+        hakai_exit_playbook = {"available": False, "description": f"hakai playbook error: {_hpe}"}
+
     # Synthesise trade setups from all sub-models
     trade_setups = _compute_trade_setups(
         prob, mr, session, btc, settlement, cg_oi_fund, liq_cascade, market_state
@@ -2895,5 +3282,7 @@ def compute_projections(data, market_state):
         "opportunity": opportunity,
         "trade_setups": trade_setups,
         "desk_setups": desk_setups,
+        "squeeze_scorecard": squeeze_scorecard,
+        "hakai_exit_playbook": hakai_exit_playbook,
         "summary": summary,
     }

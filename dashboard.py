@@ -919,7 +919,92 @@ with tab_desk:
                 unsafe_allow_html=True,
             )
 
-    # ── 1g. All systematic signal details (expander) ─────────────────────────
+    # ── 1i. 24h Opportunity Calendar ─────────────────────────────────────────
+    if _scenario in ("STAND_ASIDE", "WATCH"):
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-label">24h Opportunity Calendar</div>',
+                    unsafe_allow_html=True)
+
+        # Build settlement + session windows for next 24h
+        from systematic_signals import SETTLE_HOURS, P95_THRESHOLD, P99_THRESHOLD
+        from market_state import SESSION_MAP
+
+        _now_h   = utc_now.hour
+        _now_m   = utc_now.minute
+        _cal_slots = []
+
+        for _offset_h in range(25):
+            _slot_h = (_now_h + _offset_h) % 24
+            _is_settle = _slot_h in SETTLE_HOURS
+            # Session at this hour
+            _sess_match = None
+            _bps_hr     = 0
+            for _sn, _si in SESSION_MAP.items():
+                _sh, _eh = _si.get("utc_range", (0, 0))
+                if _sh <= _slot_h < _eh or (_sh > _eh and (_slot_h >= _sh or _slot_h < _eh)):
+                    _sess_match = _sn
+                    _bps_hr     = _si.get("avg_bps", 0)
+                    break
+            _is_prime = _bps_hr >= 20
+            _is_avoid = _bps_hr <= -5
+            _cal_slots.append({
+                "h": _slot_h, "offset": _offset_h,
+                "settle": _is_settle, "session": _sess_match,
+                "bps": _bps_hr, "prime": _is_prime, "avoid": _is_avoid,
+            })
+
+        # Build HTML timeline bar
+        _bar_cells = []
+        for _s in _cal_slots[:24]:
+            _bg = ("#00251a" if _s["prime"] else
+                   "#1a0000" if _s["avoid"] else
+                   "#111618")
+            _border = "2px solid #4caf50" if _s["prime"] else "2px solid #ef5350" if _s["avoid"] else "1px solid #21262d"
+            _dot = "⊕" if _s["settle"] else ""
+            _dot_c = "#f9a825" if _fund_display >= P95_THRESHOLD else "#546e7a"
+            _label = f"{_s['h']:02d}"
+            _cell = (
+                f'<div style="flex:1;background:{_bg};border:{_border};border-radius:4px;'
+                f'text-align:center;padding:6px 2px;margin:0 1px;min-width:0">'
+                f'<div style="font-size:0.65rem;color:#546e7a">{_label}</div>'
+                + (f'<div style="font-size:0.7rem;color:{_dot_c}">{_dot}</div>' if _dot else
+                   f'<div style="height:14px"></div>') +
+                f'</div>'
+            )
+            _bar_cells.append(_cell)
+
+        # Settlement alignment highlights
+        _next_settle_h  = next((s for s in sorted(SETTLE_HOURS) if s > _now_h), min(SETTLE_HOURS))
+        _settle_mins    = ((_next_settle_h - _now_h) * 60 - _now_m)
+
+        # Funding gap to next threshold
+        _to_p95 = max(0, P95_THRESHOLD - _fund_display)
+        _to_p99 = max(0, P99_THRESHOLD - _fund_display)
+
+        st.markdown(
+            f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;'
+            f'padding:14px 18px">'
+            f'<div style="display:flex;gap:2px;margin-bottom:8px">'
+            + "".join(_bar_cells) +
+            f'</div>'
+            f'<div style="display:flex;gap:24px;font-size:0.72rem;color:#546e7a;'
+            f'flex-wrap:wrap">'
+            f'<span><span style="color:#4caf50">■</span> Prime session (&gt;20bps/hr)</span>'
+            f'<span><span style="color:#ef5350">■</span> Avoid (&lt;-5bps/hr)</span>'
+            f'<span><span style="color:#f9a825">⊕</span> Settlement (every 4h)</span>'
+            f'<span>Current hour: <b style="color:#fff">{_now_h:02d}:00 UTC</b></span>'
+            f'<span>Next settle: <b style="color:#f9a825">{_next_settle_h:02d}:00</b> '
+            f'({_settle_mins}min)</span>'
+            f'</div>'
+            f'<div style="margin-top:8px;font-size:0.78rem;color:#9e9e9e">'
+            f'Bounce trigger needs <b>+{_to_p95:.6f}</b> more funding · '
+            f'Fade trigger needs <b>+{_to_p99:.6f}</b> more funding'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── 1j. All systematic signal details (expander) ─────────────────────────
     if _ds_all:
         with st.expander("⚙️ All systematic signals — status detail"):
             for _sig in _ds_all:
@@ -1233,6 +1318,63 @@ with tab_mkt:
             st.info("No derivatives snapshot. Run automation.py to refresh.")
         else:
             active = deriv[deriv["open_interest_usd"] > 10_000].copy()
+
+            # ── Smart Money vs Retail Consensus ──────────────────────────
+            _sm_n    = min(5, len(active))
+            _sm      = active.nlargest(_sm_n, "open_interest_usd")
+            _rt      = active.iloc[_sm_n:]
+            _sm_oi   = _sm["open_interest_usd"].sum()
+            _rt_oi   = _rt["open_interest_usd"].sum()
+            _sm_fund = ((_sm["funding_rate"] * _sm["open_interest_usd"]).sum() / _sm_oi
+                        if _sm_oi > 0 else 0)
+            _rt_fund = ((_rt["funding_rate"] * _rt["open_interest_usd"]).sum() / _rt_oi
+                        if _rt_oi > 0 else 0)
+            _fund_div = _sm_fund - _rt_fund
+
+            # Interpret divergence
+            if _sm_fund < 0 and _rt_fund > 0:
+                _div_interp = "Smart money SHORT / retail LONG — squeeze setup confirmed"
+                _div_color  = "#ef5350"
+            elif _sm_fund < _rt_fund * 0.3 and _rt_fund > 0.001:
+                _div_interp = f"Smart money less bullish than retail (div={_fund_div:.4f})"
+                _div_color  = "#f9a825"
+            elif _sm_fund > 0 and _rt_fund < 0:
+                _div_interp = "Smart money LONG / retail SHORT — momentum confirmed"
+                _div_color  = "#4caf50"
+            else:
+                _div_interp = f"Smart money ≈ retail (div={_fund_div:.4f})"
+                _div_color  = "#78909c"
+
+            # Basis trend
+            _dh = data.get("derivatives_history")
+            _basis_trend = None
+            _basis_now   = None
+            if _dh is not None and "avg_basis_pct" in _dh.columns and len(_dh) >= 5:
+                _basis_vals  = _dh["avg_basis_pct"].dropna()
+                _basis_now   = float(_basis_vals.iloc[-1]) if len(_basis_vals) else None
+                _basis_5d    = float(_basis_vals.iloc[-max(1,len(_basis_vals)//5)]) if len(_basis_vals) >= 5 else None
+                if _basis_now is not None and _basis_5d is not None:
+                    _basis_trend = "rising" if _basis_now > _basis_5d + 0.02 else "falling" if _basis_now < _basis_5d - 0.02 else "flat"
+
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Smart Money Funding", f"{_sm_fund:.4f}%",
+                       help=f"Weighted avg of top {_sm_n} venues by OI")
+            sm2.metric("Retail Funding", f"{_rt_fund:.4f}%",
+                       help=f"Weighted avg of {len(_rt)} smaller venues")
+            sm3.metric("Divergence", f"{_fund_div:+.4f}%",
+                       help="Negative = smart money less bullish (or more short)")
+            sm4.metric("Basis", f"{_basis_now:.3f}%" if _basis_now is not None else "—",
+                       delta=_basis_trend)
+
+            st.markdown(
+                f'<div style="background:#0d1117;border:1px solid {_div_color}55;'
+                f'border-radius:8px;padding:12px 16px;margin-bottom:16px">'
+                f'<span style="color:{_div_color};font-weight:700">Consensus: </span>'
+                f'<span style="color:#ccc">{_div_interp}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
             st.subheader(f"Cross-Exchange Positioning — {len(active)} venues")
             dc1, dc2 = st.columns(2)
             with dc1:
